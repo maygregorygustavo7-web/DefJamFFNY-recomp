@@ -1,0 +1,116 @@
+name: Def Jam - V12 compile shaderc for Android ARM64
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-shaderc-v12.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shaderc-arm64:
+    name: Build authentic Android ARM64 shaderc dependency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout project for tracking
+        uses: actions/checkout@v4
+
+      - name: Verify NDK and establish report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p shaderc-v12-report shaderc-v12-artifact
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          echo "Shaderc V12 - Android ARM64 library build, no game files or APK" > shaderc-v12-report/README.txt
+          echo "Android NDK: $ANDROID_NDK_HOME" >> shaderc-v12-report/README.txt
+          cmake --version | head -1 >> shaderc-v12-report/README.txt
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -1 >> shaderc-v12-report/README.txt
+
+      - name: Fetch pinned shaderc and its pinned source dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --branch v2024.4 --depth 1 \
+            https://github.com/google/shaderc.git shaderc-v12-source \
+            > shaderc-v12-report/clone.log 2>&1
+          git -C shaderc-v12-source rev-parse HEAD > shaderc-v12-report/shaderc-commit.txt
+          (cd shaderc-v12-source && python3 utils/git-sync-deps) \
+            > shaderc-v12-report/dependencies.log 2>&1
+          for dep in glslang spirv-tools spirv-headers; do
+            test -d "shaderc-v12-source/third_party/$dep" || {
+              echo "Dependency folder missing: $dep" >&2
+              exit 1
+            }
+          done
+
+      - name: Configure shaderc for Android ARM64 NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S shaderc-v12-source -B shaderc-v12-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_static \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DSHADERC_SKIP_INSTALL=ON \
+            -DSHADERC_ENABLE_WERROR_COMPILE=OFF \
+            -DSPIRV_SKIP_TESTS=ON \
+            > shaderc-v12-report/configure.log 2>&1
+          tail -n 18 shaderc-v12-report/configure.log
+
+      - name: Cross-build genuine shaderc_combined static library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build shaderc-v12-build --target shaderc_combined --parallel 4 \
+            > shaderc-v12-report/build.log 2>&1 || {
+              tail -n 90 shaderc-v12-report/build.log
+              exit 1
+            }
+          archive=$(find shaderc-v12-build -type f -name 'libshaderc_combined.a' -print -quit)
+          test -n "$archive" && test -s "$archive"
+          cp "$archive" shaderc-v12-artifact/libshaderc_combined.a
+          echo "$archive" > shaderc-v12-report/library-source-path.txt
+          echo 'PASS: shaderc_combined ARM64 archive built' | tee shaderc-v12-report/result.txt
+
+      - name: Confirm ARM64 contents and required shaderc symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          nm="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          lib=shaderc-v12-artifact/libshaderc_combined.a
+          "$nm" --defined-only "$lib" > shaderc-v12-report/defined-symbols.txt
+          for name in shaderc_compile_into_spv shaderc_compile_options_initialize shaderc_result_release; do
+            if grep -Eq "[[:space:]]${name}$" shaderc-v12-report/defined-symbols.txt; then
+              echo "PASS: $name" | tee -a shaderc-v12-report/result.txt
+            else
+              echo "FAIL: $name not found" | tee -a shaderc-v12-report/result.txt
+              exit 1
+            fi
+          done
+          du -h "$lib" | tee -a shaderc-v12-report/result.txt
+          echo 'No Vulkan renderer link or game execution is claimed.' >> shaderc-v12-report/result.txt
+
+      - name: Upload complete logs even if build fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-shaderc-v12-build-report
+          path: shaderc-v12-report/
+          if-no-files-found: warn
+
+      - name: Upload ARM64 shaderc library if built successfully
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-shaderc-v12-arm64-static-library
+          path: shaderc-v12-artifact/libshaderc_combined.a
+          if-no-files-found: error
