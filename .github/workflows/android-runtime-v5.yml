@@ -1,0 +1,89 @@
+name: Def Jam - Android Xbox Runtime V5
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-runtime-v5.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  xbox-runtime-arm64:
+    name: Compile real Xbox runtime components for Android ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out project and pinned Xbox recompilation toolkit
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify source and Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f tools/xboxrecomp/src/platform/CMakeLists.txt
+          test -f tools/xboxrecomp/src/kernel/CMakeLists.txt
+          test -f tools/xboxrecomp/src/settings/CMakeLists.txt
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          echo "Pinned xboxrecomp commit: $(git -C tools/xboxrecomp rev-parse HEAD)"
+          echo "Android NDK: $ANDROID_NDK_HOME"
+          cmake --version
+          ninja --version
+
+      - name: Configure actual runtime modules using the Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-runtime-probe build-logs
+          cat > android-runtime-probe/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(defjam_android_runtime_probe LANGUAGES C)
+          set(CMAKE_C_STANDARD 11)
+          if(NOT DEFINED XBOXRECOMP_ROOT)
+            message(FATAL_ERROR "Pass XBOXRECOMP_ROOT pointing to the pinned toolkit")
+          endif()
+          add_subdirectory("${XBOXRECOMP_ROOT}/src/settings" "${CMAKE_BINARY_DIR}/settings")
+          add_subdirectory("${XBOXRECOMP_ROOT}/src/platform" "${CMAKE_BINARY_DIR}/platform")
+          add_subdirectory("${XBOXRECOMP_ROOT}/src/kernel" "${CMAKE_BINARY_DIR}/kernel")
+          EOF
+          cmake -S android-runtime-probe -B android-runtime-probe/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DXBOXRECOMP_ROOT="$GITHUB_WORKSPACE/tools/xboxrecomp" \
+            2>&1 | tee build-logs/configure.log
+
+      - name: Compile real runtime libraries and record portability errors
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p build-logs
+          failed=0
+          : > build-logs/results.txt
+          for target in recomp_settings platform xbox_kernel; do
+            echo "=== $target ===" | tee -a build-logs/results.txt
+            if cmake --build android-runtime-probe/build --target "$target" --parallel 2 \
+                > "build-logs/$target.log" 2>&1; then
+              echo "PASS: $target (Android ARM64)" | tee -a build-logs/results.txt
+            else
+              echo "FAIL: $target (see $target.log)" | tee -a build-logs/results.txt
+              tail -n 55 "build-logs/$target.log"
+              failed=1
+            fi
+          done
+          echo "--- Summary ---"
+          cat build-logs/results.txt
+          exit "$failed"
+
+      - name: Upload native build results, including errors
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-android-runtime-v5-build-logs
+          path: build-logs/
+          if-no-files-found: warn
