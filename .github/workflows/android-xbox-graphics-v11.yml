@@ -1,0 +1,143 @@
+name: Def Jam - V11 Android Xbox Vulkan linker dependency audit
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-xbox-graphics-v11.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  graphics-link-audit:
+    name: Audit real Xbox Vulkan renderer link requirements for Android ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout real xboxrecomp source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Reproduce V10's successful ARM64 object compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/android-xbox-graphics-v10.yml
+          python3 - <<'PYEXTRACT'
+          from pathlib import Path
+          import subprocess
+
+          src = Path('.github/workflows/android-xbox-graphics-v10.yml').read_text(encoding='utf-8')
+          steps = [
+              'Verify original renderer source and Android NDK',
+              'Fetch header-only shaderc API from pinned tag',
+              'Cross-compile real Xbox graphics components and collect diagnostic results',
+          ]
+          for n, name in enumerate(steps, 1):
+              heading = '      - name: ' + name + '\n'
+              assert src.count(heading) == 1, f'Missing V10 source step: {name}'
+              a = src.index('        run: |\n', src.index(heading)) + len('        run: |\n')
+              b = src.find('\n      - name: ', a)
+              if b < 0:
+                  b = len(src)
+              block = src[a:b].splitlines(keepends=True)
+              lines = []
+              for line in block:
+                  if not line.strip():
+                      lines.append('\n')
+                  elif line.startswith('          '):
+                      lines.append(line[10:])
+                  else:
+                      raise SystemExit(f'Unexpected indentation in V10 step {name}: {line!r}')
+              path = Path(f'/tmp/defjam-v11-reuse-{n}.sh')
+              path.write_text('set -euo pipefail\n'+''.join(lines), encoding='utf-8')
+              print('Reusing V10:', name, flush=True)
+              subprocess.run(['bash', '-n', str(path)], check=True)
+              subprocess.run(['bash', str(path)], check=True)
+          PYEXTRACT
+
+      - name: Audit Android ARM64 graphics linker dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p graphics-v11-report
+          toolbin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc="$toolbin/clang"
+          nm="$toolbin/llvm-nm"
+          readelf="$toolbin/llvm-readelf"
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          objects=(
+            graphics-v10-objects/d3d8_formats.o
+            graphics-v10-objects/d3d8_combiners.o
+            graphics-v10-objects/d3d8_vk_cache.o
+            graphics-v10-objects/d3d8_vk.o
+          )
+          for obj in "${objects[@]}"; do
+            test -s "$obj"
+            "$readelf" -h "$obj" > "graphics-v11-report/$(basename "$obj").elf-header.txt"
+            grep -q 'AArch64' "graphics-v11-report/$(basename "$obj").elf-header.txt"
+          done
+
+          # An audit, NOT a renderer build. We deliberately require every
+          # external symbol to resolve, to identify missing runtime dependencies.
+          set +e
+          "$cc" --target=aarch64-none-linux-android28 --sysroot="$sysroot" \
+            -shared -Wl,--no-undefined -Wl,--error-limit=0 \
+            "${objects[@]}" \
+            -lvulkan -ldl -llog -lm \
+            -o graphics-v11-report/libxbox_render_LINK_PROBE_ONLY.so \
+            > graphics-v11-report/linker.log 2>&1
+          link_status=$?
+          set -e
+          echo "$link_status" > graphics-v11-report/linker-exit-code.txt
+          "$nm" --undefined-only "${objects[@]}" \
+            > graphics-v11-report/raw-object-undefined-symbols.txt 2>&1 || true
+          python3 - <<'PYSUMMARY'
+          from pathlib import Path
+          import re
+          from collections import Counter
+          out = Path('graphics-v11-report')
+          log = (out/'linker.log').read_text(errors='replace')
+          symbols = sorted(set(re.findall(r'undefined symbol: ([^\s]+)', log)))
+          status = int((out/'linker-exit-code.txt').read_text().strip())
+          def bucket(symbol):
+              if symbol.startswith('shaderc_'): return 'shaderc runtime / shader compiler'
+              if symbol.startswith(('pgraph_', 'nv2a_')): return 'NV2A translator'
+              if symbol.startswith(('xbox_', 'XBOX_')): return 'Xbox host/kernel functions'
+              if symbol.startswith(('d3d8_', 'D3D8', 'Direct3D')): return 'Other Xbox D3D8 functions'
+              if symbol.startswith(('SDL_', 'SDL3_')): return 'SDL window/input support'
+              return 'Other native dependencies'
+          counts = Counter(bucket(s) for s in symbols)
+          lines = [
+              '# Def Jam V11 — Android ARM64 linker readiness',
+              '',
+              'This links genuine xboxrecomp D3D8/Vulkan object files (compiled in V10).',
+              'It does not bundle game assets, build a runnable renderer, or create an APK.',
+              'The shaderc headers used at compile time are not a shaderc Android library.',
+              '',
+              f'Linker exit code: {status}',
+              f'Unique missing symbols reported: {len(symbols)}',
+              '',
+              '## Missing-symbol categories',
+          ]
+          for label, count in sorted(counts.items()):
+              lines.append(f'- {label}: {count}')
+          lines.extend(['', '## Missing symbols (all reported)', *[f'- `{s}`' for s in symbols], ''])
+          if status == 0:
+              lines += ['NOTE: Link succeeded. A link is not proof of graphics correctness or gameplay.']
+          else:
+              lines += ['NOTE: Link failure is EXPECTED at this audit stage. See linker.log.']
+          (out/'SUMMARY.md').write_text('\n'.join(lines)+'\n')
+          print('\n'.join(lines[:21]))
+          PYSUMMARY
+
+      - name: Upload V11 link dependency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-xbox-vulkan-v11-link-report
+          path: graphics-v11-report/
+          if-no-files-found: warn
