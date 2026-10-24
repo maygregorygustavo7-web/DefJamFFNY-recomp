@@ -1,0 +1,174 @@
+name: Def Jam - Android controls prototype
+
+on:
+  push:
+    branches: [android-prototype]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout experimental branch
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The ubuntu-24.04 image already contains the Android SDK/API 35.
+      # Avoid downloading obsolete SDK tools or accepting licenses again.
+      - name: Check preinstalled Android SDK
+        shell: bash
+        run: |
+          echo "Android SDK: $ANDROID_HOME"
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar" || { echo "Android 35 platform is missing"; exit 1; }
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2" || { echo "Android 35 build-tools are missing"; exit 1; }
+          echo "Android 35 SDK found."
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Prepare game-free Android touch-controls prototype
+        shell: bash
+        run: |
+          mkdir -p prototype-android/app/src/main/java/com/defjam/prototype
+          cat > prototype-android/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DefJamTouchPrototype'
+          include ':app'
+          EOF
+          cat > prototype-android/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+          cat > prototype-android/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.defjam.prototype'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.defjam.prototype'
+                  minSdk 26
+                  targetSdk 28
+                  versionCode 1
+                  versionName '0.1'
+              }
+          }
+          EOF
+          cat > prototype-android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          mkdir -p prototype-android/app/src/main
+          cat > prototype-android/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Def Jam - Controls Test" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > prototype-android/app/src/main/java/com/defjam/prototype/MainActivity.java <<'EOF'
+          package com.defjam.prototype;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import java.util.HashSet;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+              @Override public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().getDecorView().setSystemUiVisibility(
+                          View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                          View.SYSTEM_UI_FLAG_FULLSCREEN |
+                          View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+                          View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                          View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+                  setContentView(new TouchPad());
+              }
+
+              private class TouchPad extends View {
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final String[] names = {"L2", "L1", "R1", "R2", "↑", "←", "→", "↓", "□", "△", "○", "×", "SELECT", "START"};
+                  private final float[][] pos = {
+                      {.075f,.17f},{.18f,.17f},{.82f,.17f},{.925f,.17f},
+                      {.15f,.53f},{.095f,.67f},{.205f,.67f},{.15f,.81f},
+                      {.77f,.67f},{.825f,.53f},{.88f,.67f},{.825f,.81f},
+                      {.44f,.87f},{.56f,.87f}
+                  };
+                  private final Set<Integer> pressed = new HashSet<>();
+
+                  TouchPad() { super(MainActivity.this); setLayerType(View.LAYER_TYPE_SOFTWARE, null); }
+                  @Override protected void onDraw(Canvas c) {
+                      int w = getWidth(), h = getHeight();
+                      c.drawColor(Color.rgb(16,22,32));
+                      p.setColor(Color.WHITE); p.setTextSize(h*.047f); p.setTextAlign(Paint.Align.CENTER);
+                      c.drawText("DEF JAM - ANDROID / CONTROLES EXPERIMENTAIS", w*.50f,h*.35f,p);
+                      p.setColor(Color.LTGRAY); p.setTextSize(h*.033f);
+                      c.drawText("APENAS TESTE DE TOQUES - O JOGO AINDA NAO ESTA INTEGRADO",w*.50f,h*.41f,p);
+                      float r = h*.067f;
+                      for (int i=0;i<names.length;i++) {
+                          float x=pos[i][0]*w, y=pos[i][1]*h;
+                          boolean down = pressed.contains(i);
+                          p.setColor(down ? Color.rgb(45,185,170) : Color.rgb(63,79,107));
+                          p.setAlpha(down ? 245 : 175);
+                          c.drawCircle(x,y,r,p);
+                          p.setColor(Color.WHITE); p.setAlpha(255);
+                          p.setTextSize(names[i].length()>2 ? h*.026f : h*.045f);
+                          c.drawText(names[i],x,y+h*.014f,p);
+                      }
+                      p.setColor(Color.rgb(182,200,216));p.setTextSize(h*.029f);
+                      c.drawText("BOTOES PRESSIONADOS: " + pressed.size(),w*.50f,h*.58f,p);
+                  }
+                  @Override public boolean onTouchEvent(MotionEvent ev) {
+                      int action = ev.getActionMasked();
+                      if (action == MotionEvent.ACTION_CANCEL) { pressed.clear(); invalidate(); return true; }
+                      pressed.clear();
+                      int skip = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
+                              ? ev.getActionIndex() : -1;
+                      float w = getWidth(), h = getHeight(), rr = h*.088f;
+                      for (int j=0;j<ev.getPointerCount();j++) {
+                          if (j==skip) continue;
+                          float x=ev.getX(j), y=ev.getY(j);
+                          for (int i=0;i<names.length;i++) {
+                              float dx=x-pos[i][0]*w, dy=y-pos[i][1]*h;
+                              if (dx*dx+dy*dy <= rr*rr) pressed.add(i);
+                          }
+                      }
+                      invalidate();
+                      return true;
+                  }
+              }
+          }
+          EOF
+
+      - name: Build prototype debug APK
+        run: gradle -p prototype-android :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK for Galaxy M55
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-touch-prototype-apk
+          path: prototype-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
