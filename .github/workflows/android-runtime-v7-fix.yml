@@ -1,0 +1,111 @@
+name: Def Jam - V7B real Xbox kernel device test (fixed)
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-runtime-v7-fix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-xbox-runtime-on-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out fork and pinned Xbox toolkit
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Check source and Android SDK/NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          test -f tools/xboxrecomp/src/kernel/kernel_crypto.c
+          test -f .github/workflows/android-runtime-v6.yml
+          test -f .github/workflows/android-runtime-v7.yml
+
+      - name: Reuse proven V6 Android compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEXTRACT'
+          from pathlib import Path
+          source = Path('.github/workflows/android-runtime-v6.yml')
+          lines = source.read_text(encoding='utf-8').splitlines(keepends=True)
+          heading = '      - name: Apply temporary Android compatibility adaptations\n'
+          if heading not in lines:
+              raise SystemExit('V6 patch step not found')
+          i = lines.index(heading)
+          start = next(j for j in range(i+1, len(lines)) if lines[j].strip() == 'run: |') + 1
+          out = []
+          for line in lines[start:]:
+              if line.startswith('      - name: '):
+                  break
+              if line.strip():
+                  if not line.startswith('          '):
+                      raise SystemExit('Unexpected V6 script indent: '+repr(line))
+                  out.append(line[10:])
+              else:
+                  out.append('\n')
+          Path('/tmp/defjam-v6-android-patch.sh').write_text('set -euo pipefail\n'+''.join(out), encoding='utf-8')
+          PYEXTRACT
+          bash /tmp/defjam-v6-android-patch.sh
+
+      - name: Generate Android app using the V7 native kernel test source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEXTRACT'
+          from pathlib import Path
+          source = Path('.github/workflows/android-runtime-v7.yml')
+          lines = source.read_text(encoding='utf-8').splitlines(keepends=True)
+          heading = '      - name: Generate game-free Android app with actual Xbox kernel test\n'
+          if heading not in lines:
+              raise SystemExit('V7 app generator step not found')
+          i = lines.index(heading)
+          start = next(j for j in range(i+1, len(lines)) if lines[j].strip() == 'run: |') + 1
+          out = []
+          for line in lines[start:]:
+              if line.startswith('      - name: '):
+                  break
+              if line.strip():
+                  if not line.startswith('          '):
+                      raise SystemExit('Unexpected V7 script indent: '+repr(line))
+                  out.append(line[10:])
+              else:
+                  out.append('\n')
+          Path('/tmp/defjam-v7-android-app.sh').write_text('set -euo pipefail\n'+''.join(out), encoding='utf-8')
+          PYEXTRACT
+          bash /tmp/defjam-v7-android-app.sh
+
+      - name: Build actual Xbox kernel device-test APK
+        shell: bash
+        run: gradle -p android-v7 :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify native Xbox test library in APK
+        shell: bash
+        run: unzip -l android-v7/app/build/outputs/apk/debug/app-debug.apk | grep -F 'lib/arm64-v8a/libxboxkerneltest.so'
+
+      - name: Upload V7B native Xbox test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-real-xbox-kernel-v7b-apk
+          path: android-v7/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
