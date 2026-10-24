@@ -1,0 +1,116 @@
+name: Def Jam - V10 real Xbox Vulkan renderer ARM64 compile probe
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-xbox-graphics-v10.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  graphics-probe:
+    name: Compile actual xboxrecomp D3D8 Vulkan sources for Android ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned Xbox recompilation runtime
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify original renderer source and Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in \
+            tools/xboxrecomp/src/d3d/d3d8_vk.c \
+            tools/xboxrecomp/src/d3d/d3d8_vk_cache.c \
+            tools/xboxrecomp/src/d3d/d3d8_formats.c \
+            tools/xboxrecomp/src/d3d/d3d8_combiners.c; do
+            test -f "$f"
+          done
+          test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          test -f "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/vulkan/vulkan.h"
+          mkdir -p graphics-v10-logs graphics-v10-objects graphics-v10-include/shaderc
+          git -C tools/xboxrecomp rev-parse HEAD | tee graphics-v10-logs/pinned-runtime-commit.txt
+          echo "NDK: $ANDROID_NDK_HOME" | tee graphics-v10-logs/environment.txt
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -n 1 | tee -a graphics-v10-logs/environment.txt
+
+      - name: Fetch header-only shaderc API from pinned tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Headers are only for the compilation probe. No host x86_64
+          # shaderc library is linked into an Android shared object.
+          base='https://raw.githubusercontent.com/google/shaderc/v2024.4/libshaderc/include/shaderc'
+          for name in shaderc.h env.h status.h visibility.h; do
+            curl -fL --retry 3 --connect-timeout 15 \
+              --output "graphics-v10-include/shaderc/$name" "$base/$name"
+            test -s "graphics-v10-include/shaderc/$name"
+          done
+          printf '%s\n' \
+            'Shaderc C API headers: google/shaderc v2024.4' \
+            'No Android shaderc binary is bundled or assumed.' \
+            'This is compile-only, not a linked renderer nor a playable game.' \
+            > graphics-v10-logs/scope.txt
+
+      - name: Cross-compile real Xbox graphics components and collect diagnostic results
+        shell: bash
+        run: |
+          set -uo pipefail
+          root="$GITHUB_WORKSPACE/tools/xboxrecomp/src"
+          cc="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          failed=0
+          : > graphics-v10-logs/results.txt
+          sources=(
+            d3d8_formats.c
+            d3d8_combiners.c
+            d3d8_vk_cache.c
+            d3d8_vk.c
+          )
+          for name in "${sources[@]}"; do
+            echo "=== $name ===" | tee -a graphics-v10-logs/results.txt
+            if "$cc" --target=aarch64-none-linux-android28 \
+                --sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
+                -std=gnu11 -fPIC -O0 -D_GNU_SOURCE -DANDROID \
+                -I"$root" -I"$root/platform" -I"$root/d3d" \
+                -I"$GITHUB_WORKSPACE/graphics-v10-include" \
+                -c "$root/d3d/$name" \
+                -o "$GITHUB_WORKSPACE/graphics-v10-objects/${name%.c}.o" \
+                > "graphics-v10-logs/${name%.c}.log" 2>&1; then
+              echo "PASS: ARM64 object compiled: $name" | tee -a graphics-v10-logs/results.txt
+            else
+              echo "FAIL: ARM64 object failed: $name" | tee -a graphics-v10-logs/results.txt
+              sed -n '1,75p' "graphics-v10-logs/${name%.c}.log"
+              failed=1
+            fi
+          done
+          echo '--- Complete summary ---'
+          cat graphics-v10-logs/results.txt
+          printf '\nCompilation exit status: %s\n' "$failed" >> graphics-v10-logs/results.txt
+          exit "$failed"
+
+      - name: Inspect symbols and confirm compilation-only scope
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          nm_tool="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          echo 'Real recompiled Xbox Vulkan device probe (object files only)' > graphics-v10-logs/README.txt
+          echo 'Not linked with shaderc; no Vulkan surface or gameplay.' >> graphics-v10-logs/README.txt
+          for obj in graphics-v10-objects/*.o; do
+            test -f "$obj" || continue
+            echo "Object: $(basename "$obj")" >> graphics-v10-logs/README.txt
+            "$nm_tool" --undefined-only "$obj" > "graphics-v10-logs/$(basename "$obj").undefined-symbols.txt" 2>&1 || true
+          done
+
+      - name: Upload complete V10 graphics portability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-xbox-vulkan-v10-compile-report
+          path: graphics-v10-logs/
+          if-no-files-found: warn
