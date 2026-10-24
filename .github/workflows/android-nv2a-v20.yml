@@ -1,0 +1,199 @@
+name: Def Jam - V20 Android NV2A PGRAPH real GPU draw test
+
+'on':
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-nv2a-v20.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  nv2a-pgraph-gpu-draw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout pinned Xbox recompilation and workflows
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Rebuild verified V16 Android draw test project
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYREUSE'
+          from pathlib import Path
+          import subprocess
+          src=Path('.github/workflows/android-renderer-v16.yml').read_text(encoding='utf-8')
+          stages=[
+              'Reuse validated V15 Android GPU project and authentic renderer',
+              'Generate V16 offscreen GPU draw and pixel readback test',
+          ]
+          for n,name in enumerate(stages,1):
+              marker='      - name: '+name+'\n'
+              assert src.count(marker)==1, f'Cannot locate V16 stage: {name}'
+              pos=src.index(marker)
+              start=src.index('        run: |\n',pos)+len('        run: |\n')
+              end=src.find('\n      - name: ',start)
+              if end<0:end=len(src)
+              lines=[]
+              for line in src[start:end].splitlines(keepends=True):
+                  if not line.strip(): lines.append('\n')
+                  elif line.startswith('          '): lines.append(line[10:])
+                  else: raise SystemExit('V16 stage YAML indentation changed: '+repr(line))
+              script=Path(f'/tmp/v20-reuse-{n}.sh')
+              script.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+              subprocess.run(['bash','-n',str(script)],check=True)
+              print('V20 reusing:',name,flush=True)
+              subprocess.run(['bash',str(script)],check=True)
+          PYREUSE
+
+      - name: Include V19 genuine NV2A translator ARM64 shared object
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p v20-nv2a v20-logs
+          gh run download 40053625404 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name defjam-v19-nv2a-vulkan-arm64-so \
+            --dir v20-nv2a > v20-logs/download.txt 2>&1
+          so=v20-nv2a/libxbox_nv2a_vulkan_v19.so
+          test -s "$so"
+          ndkbin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$ndkbin/llvm-readelf" -h "$so" > v20-logs/nv2a-elf.txt
+          "$ndkbin/llvm-readelf" -d "$so" > v20-logs/nv2a-dependencies.txt
+          "$ndkbin/llvm-nm" -D --defined-only "$so" > v20-logs/nv2a-exports.txt
+          grep -q AArch64 v20-logs/nv2a-elf.txt
+          for fn in pgraph_d3d11_init pgraph_d3d11_draw_ready pgraph_d3d11_get_stats; do
+            grep -Eq "[[:space:]]${fn}$" v20-logs/nv2a-exports.txt || exit 1
+          done
+          cp "$so" defjam-v15/app/src/main/jniLibs/arm64-v8a/
+          echo 'Genuine V19 NV2A library is packaged alongside genuine V13 Vulkan renderer.'
+
+      - name: Switch V16 direct triangle to genuine NV2A PGRAPH vertex translation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYPATCH'
+          from pathlib import Path
+          base=Path('defjam-v15')
+          cpp=base/'app/src/main/cpp/renderer_probe.c'
+          src=cpp.read_text(encoding='utf-8')
+          assert src.count('#include "d3d8_xbox.h"')==1
+          src=src.replace('#include "d3d8_xbox.h"', '#include "d3d8_xbox.h"\n#include "../nv2a/nv2a_pgraph_d3d11.h"')
+          before='              /* Each vertex: x,y,z,rhw, ARGB color, u,v = 28 bytes. */'
+          after='              IDirect3DSurface8 *back = NULL;'
+          assert src.count(before)==1 and src.count(after)==1
+          p=src.index(before)
+          q=src.index(after,p)
+          nv2a=r'''              /* Load genuine PGRAPH translator from separately linked V19 module. */
+              void *nv2alib = dlopen("libxbox_nv2a_vulkan_v19.so", RTLD_NOW | RTLD_LOCAL);
+              if (!nv2alib) {
+                  const char *why = dlerror();
+                  snprintf(g_report, sizeof g_report, "V20: erro carregando NV2A: %s", why ? why : "desconhecido");
+                  return (*env)->NewIntArray(env, 0);
+              }
+              void (*pgraph_init)(void) = (void (*)(void))dlsym(nv2alib, "pgraph_d3d11_init");
+              void (*pgraph_draw)(uint32_t, const PgraphReadyVertex *, uint32_t) =
+                  (void (*)(uint32_t, const PgraphReadyVertex *, uint32_t))
+                  dlsym(nv2alib, "pgraph_d3d11_draw_ready");
+              void (*pgraph_stats)(PgraphD3D11Stats *) =
+                  (void (*)(PgraphD3D11Stats *))dlsym(nv2alib, "pgraph_d3d11_get_stats");
+              if (!pgraph_init || !pgraph_draw || !pgraph_stats) {
+                  snprintf(g_report, sizeof g_report, "V20: funcoes PGRAPH nao encontradas");
+                  return (*env)->NewIntArray(env, 0);
+              }
+              pgraph_init();
+              const PgraphReadyVertex verts[3] = {
+                  {.x=160.f,.y=26.f,.z=0.5f,.u=0.f,.v=0.f,.color=0xFFFF4E42u,.w=1.f},
+                  {.x=54.f,.y=210.f,.z=0.5f,.u=0.f,.v=0.f,.color=0xFFFF4E42u,.w=1.f},
+                  {.x=266.f,.y=210.f,.z=0.5f,.u=0.f,.v=0.f,.color=0xFFFF4E42u,.w=1.f},
+              };
+              _Static_assert(sizeof(PgraphReadyVertex) == 28, "Xbox PGRAPH vertex layout changed");
+              /* NV2A primitive mode 5 = TRIANGLELIST, through the translator. */
+              pgraph_draw(5, verts, 3);
+              PgraphD3D11Stats stats = {0};
+              pgraph_stats(&stats);
+              HRESULT drew=(stats.draw_calls==1 && stats.vertices_submitted==3)?0:(HRESULT)0x80004005u;
+
+          '''
+          src=src[:p]+nv2a+src[q:]
+          src=src.replace('DEF JAM - DESENHO XBOX V16','DEF JAM - NV2A XBOX V20')
+          src=src.replace('Renderizador ORIGINAL D3D8 -> Vulkan','Tradutor ORIGINAL NV2A -> D3D8 -> Vulkan')
+          src=src.replace('DrawPrimitiveUP triangulo: %s','NV2A PGRAPH triangulo: %s')
+          src=src.replace('V16:', 'V20:')
+          src=src.replace('DefJamV16','DefJamV20')
+          cpp.write_text(src,encoding='utf-8')
+          cmake=base/'app/src/main/cpp/CMakeLists.txt'
+          c=cmake.read_text()
+          assert 'v16probe' in c
+          cmake.write_text(c.replace('v16probe','v20probe'))
+          java=base/'app/src/main/java/com/defjam/rendererprobe/MainActivity.java'
+          j=java.read_text()
+          assert 'v16probe' in j
+          j=j.replace('v16probe','v20probe').replace('V16','V20')
+          j=j.replace('DESENHAR COM GPU DO XBOX','TESTAR TRADUTOR NV2A XBOX')
+          java.write_text(j)
+          gradle=base/'app/build.gradle'
+          g=gradle.read_text()
+          assert "applicationId 'com.defjam.renderpixelsv16'" in g
+          assert 'versionCode 16' in g
+          g=g.replace('com.defjam.renderpixelsv16','com.defjam.nv2apgraphv20')
+          g=g.replace('versionCode 16','versionCode 20').replace("versionName '0.16'","versionName '0.20'")
+          gradle.write_text(g)
+          manifest=base/'app/src/main/AndroidManifest.xml'
+          m=manifest.read_text()
+          assert 'Def Jam - Desenho Xbox V16' in m
+          manifest.write_text(m.replace('Def Jam - Desenho Xbox V16','Def Jam - Tradutor NV2A V20'))
+          print('V20 uses REAL pgraph_d3d11_draw_ready -> D3D8 -> Vulkan GPU readback. No game.')
+          PYPATCH
+
+      - name: Compile V20 APK and check all genuine ARM64 libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v15 :app:assembleDebug --no-daemon --stacktrace \
+            > v20-logs/gradle-build.log 2>&1 || { tail -n 145 v20-logs/gradle-build.log; exit 1; }
+          apk=defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          unzip -l "$apk" > v20-logs/apk-contents.txt
+          for name in libxbox_nv2a_vulkan_v19.so libxbox_d3d8_vk_experimental.so libc++_shared.so libv20probe.so; do
+            grep -Fq "lib/arm64-v8a/$name" v20-logs/apk-contents.txt || { echo "Missing $name"; exit 1; }
+          done
+          sha256sum "$apk" > v20-logs/apk-sha256.txt
+          du -h "$apk"
+          echo 'Compilation and packaging PASS; on-device NV2A PGRAPH rendering NOT YET TESTED.'
+
+      - name: Upload V20 real NV2A translator GPU APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v20-real-nv2a-pgraph-gpu-apk
+          path: defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload V20 build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v20-nv2a-gpu-build-report
+          path: v20-logs/
+          if-no-files-found: warn
