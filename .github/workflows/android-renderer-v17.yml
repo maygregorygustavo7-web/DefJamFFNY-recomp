@@ -1,0 +1,341 @@
+name: Def Jam - V17 native Android surface for real Xbox Vulkan renderer
+
+'on':
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-renderer-v17.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  xbox-native-vulkan-surface:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout project with real Xbox runtime
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reuse proven V15 Android native renderer setup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYREUSE'
+          from pathlib import Path
+          import subprocess
+          src=Path('.github/workflows/android-renderer-v15.yml').read_text(encoding='utf-8')
+          steps=[
+           'Reuse V13 real ARM64 Xbox Vulkan renderer and NDK C++ library',
+           'Generate V15 Gradle project and app metadata',
+           'Generate V15 interactive Android headless Xbox GPU initialization app',
+          ]
+          for number, name in enumerate(steps,1):
+              heading='      - name: '+name+'\n'
+              assert src.count(heading)==1, 'V15 prerequisite changed: '+name
+              a=src.index('        run: |\n',src.index(heading))+len('        run: |\n')
+              b=src.find('\n      - name: ',a)
+              if b<0: b=len(src)
+              lines=[]
+              for line in src[a:b].splitlines(keepends=True):
+                  if not line.strip(): lines.append('\n')
+                  elif line.startswith('          '): lines.append(line[10:])
+                  else: raise SystemExit('Bad V15 script indent: '+repr(line))
+              p=Path('/tmp/v17-reuse-%d.sh'%number)
+              p.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+              subprocess.run(['bash','-n',str(p)],check=True)
+              subprocess.run(['bash',str(p)],check=True)
+              print('PASS reused:',name,flush=True)
+          PYREUSE
+
+      - name: Implement Android Vulkan surface and real D3D8 presentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > defjam-v15/app/src/main/java/com/defjam/rendererprobe/MainActivity.java <<'EOFJAVA'
+          package com.defjam.rendererprobe;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.content.pm.ActivityInfo;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.view.Surface;
+          import android.view.SurfaceHolder;
+          import android.view.SurfaceView;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity implements SurfaceHolder.Callback {
+              private static native String nativeDrawOnSurface(Surface surface);
+              private SurfaceView display;
+              private Button runButton;
+              private TextView status;
+              private volatile boolean surfaceReady = false;
+              private boolean testStarted = false;
+              private boolean libraryReady = false;
+
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  getWindow().getDecorView().setSystemUiVisibility(5894);
+                  setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(12, 10, 12, 10);
+                  root.setBackgroundColor(Color.rgb(10, 18, 31));
+                  status = new TextView(this);
+                  status.setTextColor(Color.WHITE);
+                  status.setTextSize(15);
+                  status.setGravity(Gravity.CENTER);
+                  status.setText("DEF JAM - V17 | GPU XBOX NA TELA\n"
+                       + "Teste direto do renderizador xboxrecomp em SurfaceView/Vulkan.\n"
+                       + "NAO e o jogo. Toque abaixo quando a superficie estiver pronta.");
+                  root.addView(status);
+                  runButton = new Button(this);
+                  runButton.setText("DESENHAR DIRETO NA TELA (V17)");
+                  runButton.setEnabled(false);
+                  root.addView(runButton);
+                  display = new SurfaceView(this);
+                  display.getHolder().addCallback(this);
+                  root.addView(display, new LinearLayout.LayoutParams(-1, 0, 1f));
+                  setContentView(root);
+                  try {
+                      System.loadLibrary("v17probe");
+                      libraryReady = true;
+                      runButton.setEnabled(surfaceReady);
+                  } catch (Throwable t) {
+                      status.setText("V17 ERRO CARREGANDO BIBLIOTECA JNI:\n" + t);
+                  }
+                  runButton.setOnClickListener(v -> {
+                      if (!surfaceReady || testStarted || !libraryReady) return;
+                      testStarted = true;
+                      runButton.setEnabled(false);
+                      Surface surface = display.getHolder().getSurface();
+                      status.setText("V17: inicializando Vulkan + swapchain Android...\n"
+                            + "Desenhando quadro a quadro (um teste unico).");
+                      new Thread(() -> {
+                          String result;
+                          try { result = nativeDrawOnSurface(surface); }
+                          catch (Throwable t) { result="V17 ERRO JNI:\n"+t; }
+                          final String msg=result;
+                          runOnUiThread(() -> {
+                              status.setText(msg);
+                              runButton.setText("TESTE FINALIZADO");
+                          });
+                      }, "XboxVulkanPresentV17").start();
+                  });
+              }
+              @Override public void surfaceCreated(SurfaceHolder h) {
+                  surfaceReady = true;
+                  if (runButton != null && libraryReady && !testStarted)
+                      runOnUiThread(() -> runButton.setEnabled(true));
+              }
+              @Override public void surfaceChanged(SurfaceHolder h, int fmt, int w, int ht) { }
+              @Override public void surfaceDestroyed(SurfaceHolder h) {
+                  surfaceReady = false;
+                  if (runButton != null) runOnUiThread(() -> runButton.setEnabled(false));
+              }
+          }
+          EOFJAVA
+          cat > defjam-v15/app/src/main/cpp/renderer_probe.c <<'EOFC'
+          #define VK_USE_PLATFORM_ANDROID_KHR 1
+          #include <jni.h>
+          #include <android/log.h>
+          #include <android/native_window_jni.h>
+          #include <vulkan/vulkan.h>
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include "d3d8_xbox.h"
+          #include "d3d8_vk.h"
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "DefJamV17", __VA_ARGS__)
+          /* One-shot GPU presentation probe; keep the window reference alive until process exit. */
+          static ANativeWindow *g_window = NULL;
+          static int create_surface(void *inst, void *out, void *user) {
+              PFN_vkCreateAndroidSurfaceKHR fn = (PFN_vkCreateAndroidSurfaceKHR)
+                  vkGetInstanceProcAddr((VkInstance)inst, "vkCreateAndroidSurfaceKHR");
+              if (!fn || !user || !out) return 0;
+              VkAndroidSurfaceCreateInfoKHR ci = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+              ci.window = (ANativeWindow*)user;
+              VkResult err=fn((VkInstance)inst,&ci,NULL,(VkSurfaceKHR*)out);
+              LOG("create_surface Android Vulkan status: %d", (int)err);
+              return err == VK_SUCCESS;
+          }
+          static void drawable_size(int *w, int *h, void *user) {
+              ANativeWindow *win=(ANativeWindow*)user;
+              *w=ANativeWindow_getWidth(win);
+              *h=ANativeWindow_getHeight(win);
+          }
+
+          typedef struct {
+              float x,y,z,rhw;
+              uint32_t color;
+              float u,v;
+          } Vertex;
+          _Static_assert(sizeof(Vertex)==28, "Xbox D3D8 pretransformed vertex must be 28 bytes");
+
+          JNIEXPORT jstring JNICALL
+          Java_com_defjam_rendererprobe_MainActivity_nativeDrawOnSurface(JNIEnv *env, jclass ignored, jobject surface) {
+              (void)ignored;
+              char msg[1200];
+              if (!surface) return (*env)->NewStringUTF(env, "V17 FALHOU: Surface Java ausente.");
+              ANativeWindow *window=ANativeWindow_fromSurface(env,surface);
+              if (!window) return (*env)->NewStringUTF(env, "V17 FALHOU: ANativeWindow_fromSurface.");
+              /* Retain Android native window for the life of the Vulkan surface (one shot). */
+              g_window=window;
+              void *so=dlopen("libxbox_d3d8_vk_experimental.so",RTLD_NOW|RTLD_LOCAL);
+              if(!so) {
+                  const char* err=dlerror();
+                  snprintf(msg,sizeof msg,"V17 FALHOU: dlopen renderer\n%s",err?err:"desconhecido");
+                  return (*env)->NewStringUTF(env,msg);
+              }
+              void (*set_host)(const D3D8VkHost *)=(void (*)(const D3D8VkHost*))dlsym(so,"d3d8_vk_set_host");
+              void (*set_cache)(const char *)=(void (*)(const char*))dlsym(so,"d3d8_vk_set_cache_dir");
+              IDirect3D8 *(*create_d3d)(UINT)=(IDirect3D8 *(*)(UINT))dlsym(so,"xbox_Direct3DCreate8");
+              if(!set_host || !set_cache || !create_d3d)
+                  return (*env)->NewStringUTF(env,"V17 FALHOU: funcoes do xboxrecomp ausentes.");
+
+              static const char *const extensions[]={"VK_KHR_surface","VK_KHR_android_surface"};
+              D3D8VkHost host;
+              memset(&host,0,sizeof host);
+              host.instance_extensions=extensions;
+              host.instance_extension_count=2;
+              host.create_surface=create_surface;
+              host.drawable_size=drawable_size;
+              host.user=window;
+              set_host(&host);
+              set_cache(NULL);
+              IDirect3D8 *d3d=create_d3d(0);
+              if(!d3d || !d3d->lpVtbl || !d3d->lpVtbl->CreateDevice)
+                  return (*env)->NewStringUTF(env,"V17 FALHOU: interface D3D8 invalida.");
+              D3DPRESENT_PARAMETERS pp={0};
+              pp.BackBufferWidth=320;
+              pp.BackBufferHeight=240;
+              pp.BackBufferFormat=D3DFMT_A8R8G8B8;
+              pp.BackBufferCount=1;
+              pp.Windowed=1;
+              IDirect3DDevice8 *dev=NULL;
+              LOG("V17 beginning Xbox Vulkan CreateDevice WITH Android surface");
+              HRESULT hr=d3d->lpVtbl->CreateDevice(d3d,0,0,NULL,0,&pp,&dev);
+              if(hr != 0 || !dev || !dev->lpVtbl) {
+                  snprintf(msg,sizeof msg,"V17 FALHOU: CreateDevice com superficie\nHRESULT: 0x%08X\nVerificar Logcat DefJamV17/D3D8-VK.",(unsigned)hr);
+                  return (*env)->NewStringUTF(env,msg);
+              }
+              if (!dev->lpVtbl->Clear || !dev->lpVtbl->DrawPrimitiveUP || !dev->lpVtbl->Present)
+                  return (*env)->NewStringUTF(env,"V17 FALHOU: Draw/Clear/Present ausentes.");
+              int frames=0;
+              HRESULT last=0;
+              for (int i=0;i<70;i++) {
+                  float shift=(float)(i-35)*1.1f;
+                  Vertex tri[3]={
+                      {160.f+shift,25.f,0.2f,1.f,0xFFFF4E42u,0.f,0.f},
+                      {55.f+shift,211.f,0.2f,1.f,0xFFFF4E42u,0.f,0.f},
+                      {265.f+shift,211.f,0.2f,1.f,0xFFFF4E42u,0.f,0.f}
+                  };
+                  hr=dev->lpVtbl->Clear(dev,0,NULL,D3DCLEAR_TARGET,0xFF183250u,1.0f,0);
+                  if(hr) { last=hr;break; }
+                  hr=dev->lpVtbl->DrawPrimitiveUP(dev,D3DPT_TRIANGLELIST,1,tri,sizeof(Vertex));
+                  if(hr) { last=hr;break; }
+                  hr=dev->lpVtbl->Present(dev,NULL,NULL,NULL,NULL);
+                  if(hr) { last=hr;break; }
+                  frames++;
+                  usleep(25000);
+              }
+              LOG("V17 native window final frames=%d hr=0x%x",frames,(unsigned)last);
+              snprintf(msg,sizeof msg,
+                "DEF JAM - SURFACE VULKAN V17\n"
+                "D3D8 Xbox + superficie Android: PASSOU\n"
+                "Draw + Present: %s\n"
+                "Quadros enviados: %d / 70\n"
+                "HRESULT: 0x%08X\n"
+                "Apresentacao real (sem copia Bitmap).\n"
+                "Nao executa o jogo.",
+                frames==70?"PASSOU":"FALHOU",frames,(unsigned)last);
+              return (*env)->NewStringUTF(env,msg);
+          }
+          EOFC
+          cat > defjam-v15/app/src/main/cpp/CMakeLists.txt <<'EOFCMAKE'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(defjam_android_vulkan_surface_bridge LANGUAGES C)
+          get_filename_component(XBOXRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/xboxrecomp" ABSOLUTE)
+          add_library(v17probe SHARED renderer_probe.c)
+          target_include_directories(v17probe PRIVATE
+            "${XBOXRECOMP_ROOT}/src"
+            "${XBOXRECOMP_ROOT}/src/d3d"
+            "${XBOXRECOMP_ROOT}/src/platform")
+          target_link_libraries(v17probe PRIVATE vulkan android log dl)
+          target_link_options(v17probe PRIVATE -Wl,--no-undefined)
+          EOFCMAKE
+          python3 - <<'PYPATCH'
+          from pathlib import Path
+          p=Path('defjam-v15/app/build.gradle')
+          s=p.read_text()
+          assert "applicationId 'com.defjam.rendererdevice'" in s
+          assert 'versionCode 15' in s
+          s=s.replace("applicationId 'com.defjam.rendererdevice'", "applicationId 'com.defjam.androidsurfacev17'")
+          s=s.replace('versionCode 15','versionCode 17').replace("versionName '0.15'","versionName '0.17'")
+          p.write_text(s)
+          p=Path('defjam-v15/app/src/main/AndroidManifest.xml')
+          s=p.read_text()
+          assert 'Def Jam - GPU Xbox V15' in s
+          s=s.replace('Def Jam - GPU Xbox V15','Def Jam - Surface Vulkan V17')
+          p.write_text(s)
+          print('V17 native Vulkan window SurfaceView project prepared.')
+          PYPATCH
+
+      - name: Compile V17 Android arm64 APK and validate native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v15 :app:assembleDebug --no-daemon --stacktrace > v15-logs/v17-build.log 2>&1 || {
+            tail -n 140 v15-logs/v17-build.log
+            exit 1
+          }
+          apk='defjam-v15/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk"
+          unzip -l "$apk" > v15-logs/v17-apk-contents.txt
+          for name in libxbox_d3d8_vk_experimental.so libc++_shared.so libv17probe.so; do
+            grep -Fq "lib/arm64-v8a/$name" v15-logs/v17-apk-contents.txt || {
+              echo "Missing $name in V17 APK"
+              exit 1
+            }
+          done
+          sha256sum "$apk" > v15-logs/v17-apk-sha256.txt
+          du -h "$apk"
+          echo 'V17: build and packaging passed, live Android surface presentation untested.'
+
+      - name: Upload V17 native Vulkan surface APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v17-real-xbox-vulkan-surface-apk
+          path: defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload build report even if compilation fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v17-android-surface-build-report
+          path: v15-logs/
+          if-no-files-found: warn
