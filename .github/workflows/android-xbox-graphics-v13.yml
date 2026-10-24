@@ -1,0 +1,196 @@
+name: Def Jam - V13 link real Xbox Vulkan renderer with ARM64 shaderc
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-xbox-graphics-v13.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  link-xbox-vulkan:
+    name: Check real D3D8 Vulkan + shaderc + Android host platform link
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Xbox recompilation sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Retrieve successful V12B genuine Android ARM64 shaderc archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p graphics-v13-report shaderc-v13-lib
+          gh run download 40050015628 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name defjam-shaderc-v12b-arm64-static-library \
+            --dir shaderc-v13-lib \
+            > graphics-v13-report/shaderc-download.log 2>&1 || {
+              cat graphics-v13-report/shaderc-download.log
+              exit 1
+            }
+          test -s shaderc-v13-lib/libshaderc_combined.a
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            --defined-only shaderc-v13-lib/libshaderc_combined.a \
+            > graphics-v13-report/shaderc-defined-symbols.txt
+          grep -Eq '[[:space:]]shaderc_compile_into_spv$' graphics-v13-report/shaderc-defined-symbols.txt
+          du -h shaderc-v13-lib/libshaderc_combined.a | tee graphics-v13-report/shaderc-size.txt
+          echo 'V12B shaderc artifact is reused without rebuilding.' > graphics-v13-report/scope.txt
+
+      - name: Reproduce confirmed V10 D3D8 Vulkan ARM64 compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYV10'
+          from pathlib import Path
+          import subprocess
+          src = Path('.github/workflows/android-xbox-graphics-v10.yml').read_text(encoding='utf-8')
+          steps = [
+              'Verify original renderer source and Android NDK',
+              'Fetch header-only shaderc API from pinned tag',
+              'Cross-compile real Xbox graphics components and collect diagnostic results',
+          ]
+          for n, name in enumerate(steps, 1):
+              heading = '      - name: '+name+'\n'
+              assert src.count(heading) == 1, 'V10 step not found: '+name
+              a = src.index('        run: |\n', src.index(heading)) + len('        run: |\n')
+              b = src.find('\n      - name: ', a)
+              if b < 0: b = len(src)
+              block = src[a:b].splitlines(keepends=True)
+              lines = []
+              for line in block:
+                  if not line.strip(): lines.append('\n')
+                  elif line.startswith('          '): lines.append(line[10:])
+                  else: raise SystemExit('Bad V10 source indentation: '+repr(line))
+              path = Path('/tmp/defjam-v13-compile-%d.sh' % n)
+              path.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+              subprocess.run(['bash','-n',str(path)],check=True)
+              print('Reusing V10:',name,flush=True)
+              subprocess.run(['bash',str(path)],check=True)
+          PYV10
+          cp graphics-v10-logs/results.txt graphics-v13-report/v10-object-results.txt
+
+      - name: Apply verified temporary Android host compatibility fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYV6'
+          from pathlib import Path
+          import subprocess
+          src = Path('.github/workflows/android-runtime-v6.yml').read_text(encoding='utf-8')
+          header = '      - name: Apply temporary Android compatibility adaptations\n'
+          assert src.count(header)==1
+          a = src.index('        run: |\n',src.index(header))+len('        run: |\n')
+          b = src.find('\n      - name: ',a)
+          if b<0: b=len(src)
+          lines=[]
+          for line in src[a:b].splitlines(keepends=True):
+              if not line.strip(): lines.append('\n')
+              elif line.startswith('          '): lines.append(line[10:])
+              else: raise SystemExit('Bad V6 indentation '+repr(line))
+          cmd=Path('/tmp/defjam-v13-patch.sh')
+          cmd.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+          subprocess.run(['bash','-n',str(cmd)],check=True)
+          subprocess.run(['bash',str(cmd)],check=True)
+          PYV6
+          cp build-logs/compatibility-notes.txt graphics-v13-report/android-host-compatibility.txt
+
+      - name: Compile authentic Xbox host platform for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tools/xboxrecomp/src/platform -B graphics-v13-platform-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            > graphics-v13-report/platform-configure.log 2>&1 || {
+              tail -n 70 graphics-v13-report/platform-configure.log; exit 1;
+            }
+          cmake --build graphics-v13-platform-build --target platform --parallel 3 \
+            > graphics-v13-report/platform-build.log 2>&1 || {
+              tail -n 70 graphics-v13-report/platform-build.log; exit 1;
+            }
+          test -s graphics-v13-platform-build/libplatform.a
+          echo 'Real POSIX/Win32 host compatibility archive compiled for Android ARM64.' \
+            >> graphics-v13-report/scope.txt
+
+      - name: Try strict linking of genuine Xbox Vulkan renderer and shader compiler
+        id: link_try
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolbin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          mkdir -p graphics-v13-output
+          set +e
+          "$toolbin/clang++" --target=aarch64-none-linux-android28 \
+            --sysroot="$sysroot" \
+            -shared -Wl,--no-undefined -Wl,--error-limit=0 \
+            graphics-v10-objects/d3d8_formats.o \
+            graphics-v10-objects/d3d8_combiners.o \
+            graphics-v10-objects/d3d8_vk_cache.o \
+            graphics-v10-objects/d3d8_vk.o \
+            graphics-v13-platform-build/libplatform.a \
+            shaderc-v13-lib/libshaderc_combined.a \
+            -lvulkan -llog -ldl -lm -lz -latomic \
+            -o graphics-v13-output/libxbox_d3d8_vk_experimental.so \
+            > graphics-v13-report/linker.log 2>&1
+          status=$?
+          set -e
+          echo "$status" > graphics-v13-report/linker-exit-code.txt
+          python3 - <<'PYSUM'
+          from pathlib import Path
+          import re
+          report=Path('graphics-v13-report')
+          status=int((report/'linker-exit-code.txt').read_text().strip())
+          log=(report/'linker.log').read_text(errors='replace')
+          missing=sorted(set(re.findall(r'undefined symbol: ([^\s]+)',log)))
+          lines=['# V13: Xbox D3D8 Vulkan + genuine shaderc Android ARM64 link', '',
+                 f'Linker exit code: {status}',
+                 f'Missing unique symbols in strict link: {len(missing)}',
+                 '', 'All 4 Xbox renderer object files are genuine xboxrecomp code.',
+                 'The shaderc archive is the genuine V12B ARM64 compilation.',
+                 'Xbox POSIX host platform uses temporary V6 Android adaptations.',
+                 'Not an APK, no graphics/game runtime test, and no recompiled game executable.',
+                 '', '## Remaining undefined symbols',
+                 *[f'- `{x}`' for x in missing], '']
+          if status == 0:
+              lines += ['SUCCESS: Experimental .so linked with no undefined symbols.',
+                        'This is NOT confirmation of initialization, rendering, shader compilation, or gameplay.']
+          else:
+              lines += ['Link failed. Check linker.log for missing or incompatible dependencies.']
+          (report/'SUMMARY.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          print('\n'.join(lines[:15]))
+          PYSUM
+          if [ "$status" -eq 0 ]; then
+            "$toolbin/llvm-readelf" -h graphics-v13-output/libxbox_d3d8_vk_experimental.so \
+              > graphics-v13-report/output-elf-header.txt
+            grep -q AArch64 graphics-v13-report/output-elf-header.txt
+            echo 'link_ok=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'link_ok=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload V13 renderer link diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-xbox-vulkan-v13-link-report
+          path: graphics-v13-report/
+          if-no-files-found: warn
+
+      - name: Upload experimental ARM64 renderer shared library only if linked
+        if: steps.link_try.outputs.link_ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-xbox-vulkan-v13-experimental-arm64-so
+          path: graphics-v13-output/libxbox_d3d8_vk_experimental.so
+          if-no-files-found: error
