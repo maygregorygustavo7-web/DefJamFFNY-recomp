@@ -1,0 +1,148 @@
+name: Def Jam - V18 Xbox NV2A translator Android ARM64 audit
+
+'on':
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-nv2a-v18.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  nv2a-to-vulkan-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout original Xbox recompilation runtime
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Retrieve V13 real Xbox Vulkan Android ARM64 library
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p v18-logs v18-build v18-vulkan
+          gh run download 40050614511 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name defjam-xbox-vulkan-v13-experimental-arm64-so \
+            --dir v18-vulkan > v18-logs/download.txt 2>&1
+          test -s v18-vulkan/libxbox_d3d8_vk_experimental.so
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$NDK_BIN/llvm-readelf" -h v18-vulkan/libxbox_d3d8_vk_experimental.so > v18-logs/renderer-elf.txt
+          "$NDK_BIN/llvm-nm" -D --defined-only v18-vulkan/libxbox_d3d8_vk_experimental.so > v18-logs/renderer-exports.txt
+          grep -q AArch64 v18-logs/renderer-elf.txt
+          for fn in xbox_GetD3DDevice d3d8_combiners_set_nv2a; do
+            if grep -Eq "[[:space:]]${fn}$" v18-logs/renderer-exports.txt; then
+              echo "$fn: exported by V13" >> v18-logs/export-precheck.txt
+            else
+              echo "$fn: NOT exported by V13" >> v18-logs/export-precheck.txt
+            fi
+          done
+
+      - name: Compile genuine Xbox NV2A PGRAPH translator and texture-pack for Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, subprocess
+          root=Path('tools/xboxrecomp/src')
+          out=Path('v18-build')
+          log=Path('v18-logs')
+          ndk=Path(os.environ['ANDROID_NDK_HOME'])/'toolchains/llvm/prebuilt/linux-x86_64/bin'
+          cc=ndk/'aarch64-linux-android28-clang'
+          include=[root,root/'nv2a',root/'d3d',root/'kernel',root/'platform']
+          args=['-fPIC','-O2','-std=gnu11','-D_GNU_SOURCE','-D_alloca=alloca','-include','alloca.h',
+                '-Wno-unused-parameter','-Wno-unknown-pragmas']
+          for d in include: args+=['-I',str(d)]
+          statuses={}
+          for filename,stem in [('nv2a_pgraph_d3d11.c','pgraph'),('texture_pack.c','texture_pack')]:
+              src=root/'nv2a'/filename
+              dst=out/(stem+'.o')
+              command=[str(cc),*args,'-c',str(src),'-o',str(dst)]
+              p=subprocess.run(command,capture_output=True,text=True)
+              statuses[stem]=p.returncode
+              (log/(stem+'-compile.log')).write_text('$ '+' '.join(command)+'\n'+p.stdout+'\n'+p.stderr)
+              print(f'{filename}: {"COMPILED" if p.returncode==0 else "FAILED"} (exit={p.returncode})',flush=True)
+          (log/'compile-status.txt').write_text('\n'.join(f'{k}: {v}' for k,v in statuses.items())+'\n')
+          PY
+
+      - name: Check undefined symbols and attempt strict NV2A Vulkan linking
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re, subprocess
+          logs=Path('v18-logs')
+          objs=[Path('v18-build/pgraph.o'),Path('v18-build/texture_pack.o')]
+          so=Path('v18-vulkan/libxbox_d3d8_vk_experimental.so')
+          ndk=Path(os.environ['ANDROID_NDK_HOME'])/'toolchains/llvm/prebuilt/linux-x86_64/bin'
+          if not all(x.exists() for x in objs):
+              summary='NV2A COMPILE FAILED: see pgraph-compile.log and texture_pack-compile.log.\nNo link attempted.\n'
+              (logs/'summary.txt').write_text(summary)
+              print(summary)
+              raise SystemExit(0) # Diagnostic workflow remains green by design.
+          nm=str(ndk/'llvm-nm')
+          defined=subprocess.run([nm,'-D','--defined-only',str(so)],capture_output=True,text=True,check=True).stdout
+          ex={line.split()[-1] for line in defined.splitlines() if line.strip()}
+          missing=set()
+          for obj in objs:
+              p=subprocess.run([nm,'-u',str(obj)],capture_output=True,text=True,check=True)
+              for line in p.stdout.splitlines():
+                  words=line.split()
+                  if words and words[-1] not in ex:
+                      missing.add(words[-1])
+          (logs/'unresolved-before-system-libs.txt').write_text('\n'.join(sorted(missing))+'\n')
+          cc=str(ndk/'aarch64-linux-android28-clang')
+          lib=Path('v18-build/libxbox_nv2a_vulkan_experimental.so')
+          cmd=[cc,'-shared','-Wl,--no-undefined',
+               '-Wl,-soname,libxbox_nv2a_vulkan_experimental.so',
+               '-o',str(lib),*(str(o) for o in objs),str(so),'-lm','-ldl','-llog','-landroid']
+          p=subprocess.run(cmd,capture_output=True,text=True)
+          (logs/'strict-link.log').write_text('$ '+' '.join(cmd)+'\n'+p.stdout+'\n'+p.stderr)
+          errors=sorted(set(re.findall(r'undefined symbol: ([^\s]+)',p.stderr)))
+          summary=[
+              'V18: genuine Xbox NV2A PGRAPH translator plus genuine V13 Vulkan renderer',
+              'Target: Android ARM64, NDK API 28',
+              'Both real NV2A source files compiled successfully.',
+              f'Strict shared-object link exit code: {p.returncode}',
+              f'Undefined symbols reported by strict linker: {len(errors)}',
+          ]
+          if errors:
+              summary.append('Linker-reported missing symbols:')
+              summary.extend(' - '+name for name in errors)
+          if p.returncode==0:
+              summary.append('PASS: NV2A translator linked into a strict ARM64 shared object.')
+              elf=subprocess.run([str(ndk/'llvm-readelf'),'-d',str(lib)],capture_output=True,text=True,check=True)
+              (logs/'nv2a-linked-elf-dependencies.txt').write_text(elf.stdout)
+          else:
+              summary.append('LINK NOT READY: inspect strict-link.log; no gameplay or APK claimed.')
+              if lib.exists(): lib.unlink()
+          summary.append('This tests NV2A integration only. No original Xbox game binary or assets are executed.')
+          message='\n'.join(summary)+'\n'
+          (logs/'summary.txt').write_text(message)
+          print(message,flush=True)
+          PY
+
+      - name: Publish V18 diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v18-nv2a-android-link-report
+          path: v18-logs/
+          if-no-files-found: warn
+
+      - name: Publish strict-linked NV2A library only if successfully built
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v18-nv2a-vulkan-arm64-so
+          path: v18-build/libxbox_nv2a_vulkan_experimental.so
+          if-no-files-found: ignore
