@@ -1,0 +1,145 @@
+name: Def Jam - V19 genuine NV2A vertex shader and Vulkan ARM64 integration
+
+'on':
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-nv2a-v19.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  nv2a-vertex-link:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout pinned Xbox recompilation source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Retrieve verified Vulkan library from V13
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p v19-logs v19-build v19-renderer
+          gh run download 40050614511 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name defjam-xbox-vulkan-v13-experimental-arm64-so \
+            --dir v19-renderer > v19-logs/download.txt 2>&1
+          test -s v19-renderer/libxbox_d3d8_vk_experimental.so
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$NDK_BIN/llvm-readelf" -h v19-renderer/libxbox_d3d8_vk_experimental.so > v19-logs/vulkan-elf.txt
+          grep -q AArch64 v19-logs/vulkan-elf.txt
+          test -f tools/xboxrecomp/src/kernel/nv2a_vsh_cpu.c
+          test -f tools/xboxrecomp/src/kernel/nv2a_vsh_interp.c
+          test -f tools/xboxrecomp/src/nv2a/nv2a_pgraph_d3d11.c
+          test -f tools/xboxrecomp/src/nv2a/texture_pack.c
+          echo 'V19: original Xbox Vulkan backend and vertex shader sources present.'
+
+      - name: Compile four real NV2A source files and attempt strict ARM64 linking
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYBUILD'
+          from pathlib import Path
+          import os, subprocess, re
+
+          root = Path('tools/xboxrecomp/src')
+          logs = Path('v19-logs')
+          out = Path('v19-build')
+          out.mkdir(exist_ok=True)
+          ndk = Path(os.environ['ANDROID_NDK_HOME']) / 'toolchains/llvm/prebuilt/linux-x86_64/bin'
+          cc = str(ndk / 'aarch64-linux-android28-clang')
+          nm = str(ndk / 'llvm-nm')
+          so = Path('v19-renderer/libxbox_d3d8_vk_experimental.so')
+          headers = [root, root/'nv2a', root/'kernel', root/'d3d', root/'platform']
+          flags = ['-fPIC','-O2','-std=gnu11','-D_GNU_SOURCE',
+                   '-D_alloca=alloca','-include','alloca.h',
+                   '-Wno-unused-parameter','-Wno-unknown-pragmas']
+          for path in headers:
+              flags.extend(['-I', str(path)])
+
+          sources = [
+              ('pgraph', root/'nv2a/nv2a_pgraph_d3d11.c'),
+              ('texture_pack', root/'nv2a/texture_pack.c'),
+              ('vsh_cpu', root/'kernel/nv2a_vsh_cpu.c'),
+              ('vsh_interp', root/'kernel/nv2a_vsh_interp.c'),
+          ]
+          objs=[]
+          statuses=[]
+          for label,src in sources:
+              dst=out/(label+'.o')
+              cmd=[cc,*flags,'-c',str(src),'-o',str(dst)]
+              p=subprocess.run(cmd,capture_output=True,text=True)
+              (logs/(label+'-compile.log')).write_text('$ '+' '.join(cmd)+'\n'+p.stdout+'\n'+p.stderr)
+              statuses.append((label,p.returncode))
+              if p.returncode==0:
+                  objs.append(dst)
+              print(f'{label}: {"COMPILED" if p.returncode==0 else "FAILED"} (exit={p.returncode})',flush=True)
+          (logs/'compile-status.txt').write_text(''.join(f'{label}: {code}\n' for label,code in statuses))
+          summary=['V19 - genuine NV2A PGRAPH + vertex program interpreter/HLSL emitter',
+                   'Target: Android ARM64 (NDK API 28)',
+                   'Real Xbox source files: nv2a_pgraph_d3d11.c, texture_pack.c, nv2a_vsh_cpu.c, nv2a_vsh_interp.c']
+          if len(objs)!=len(sources):
+              summary.append('COMPILE FAILED: inspect individual compile logs. No link attempted.')
+              (logs/'summary.txt').write_text('\n'.join(summary)+'\n')
+              print('\n'.join(summary),flush=True)
+              raise SystemExit(0) # This workflow is diagnostic; do not label as linked.
+
+          lib=out/'libxbox_nv2a_vulkan_v19.so'
+          cmd=[cc,'-shared','-Wl,--no-undefined',
+               '-Wl,-soname,libxbox_nv2a_vulkan_v19.so',
+               '-o',str(lib),*(str(o) for o in objs),str(so),
+               '-lm','-ldl','-llog','-landroid']
+          p=subprocess.run(cmd,capture_output=True,text=True)
+          (logs/'strict-link.log').write_text('$ '+' '.join(cmd)+'\n'+p.stdout+'\n'+p.stderr)
+          undefined=sorted(set(re.findall(r'undefined symbol: ([^\s]+)',p.stderr)))
+          summary += [f'All {len(objs)} real NV2A modules compiled successfully.',
+                      f'Strict ARM64 shared-object linker exit code: {p.returncode}',
+                      f'Undefined symbols reported: {len(undefined)}']
+          summary += ['  - '+sym for sym in undefined]
+          if p.returncode==0 and lib.is_file():
+              h=subprocess.run([str(ndk/'llvm-readelf'),'-h',str(lib)],capture_output=True,text=True,check=True).stdout
+              (logs/'linked-elf.txt').write_text(h)
+              d=subprocess.run([str(ndk/'llvm-readelf'),'-d',str(lib)],capture_output=True,text=True,check=True).stdout
+              (logs/'linked-dependencies.txt').write_text(d)
+              exports=subprocess.run([nm,'-D','--defined-only',str(lib)],capture_output=True,text=True,check=True).stdout
+              (logs/'linked-exports.txt').write_text(exports)
+              required=['nv2a_vsh_constants','nv2a_vsh_emit_hlsl','nv2a_vsh_program_hash',
+                        'pgraph_d3d11_init','pgraph_d3d11_draw_ready']
+              missing=[sym for sym in required if not re.search(r'\s'+re.escape(sym)+r'$',exports,re.M)]
+              if 'AArch64' in h and not missing:
+                  summary.append('PASS: Genuine NV2A translator and VSH modules strictly linked with Xbox Vulkan backend.')
+                  summary.append('PASS: Vertex shader functions and PGRAPH entry points exported.')
+              else:
+                  summary.append('VERIFY FAILED: '+repr(missing))
+                  lib.unlink()
+          else:
+              summary.append('LINK NOT READY: review strict-link.log; no working NV2A library generated.')
+              if lib.exists(): lib.unlink()
+          summary.append('No original Xbox game binary, assets, menu, gameplay or Portuguese translation executed.')
+          (logs/'summary.txt').write_text('\n'.join(summary)+'\n')
+          print('\n'.join(summary),flush=True)
+          PYBUILD
+
+      - name: Upload V19 diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v19-nv2a-vsh-link-report
+          path: v19-logs/
+          if-no-files-found: warn
+
+      - name: Upload strictly linked NV2A ARM64 library if it exists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v19-nv2a-vulkan-arm64-so
+          path: v19-build/libxbox_nv2a_vulkan_v19.so
+          if-no-files-found: ignore
