@@ -1,0 +1,250 @@
+name: Def Jam - V14 load real Xbox Vulkan renderer on Galaxy M55
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-renderer-v14.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  android-renderer-load-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Retrieve and verify genuine V13 Vulkan renderer for ARM64
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p defjam-v14/app/src/main/jniLibs/arm64-v8a
+          mkdir -p defjam-v14/app/src/main/cpp
+          mkdir -p defjam-v14/app/src/main/java/com/defjam/rendererprobe
+          mkdir -p v14-logs
+
+          echo 'Baixando biblioteca ARM64 real da V13 (nao e jogo)...'
+          gh run download 40050614511 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name defjam-xbox-vulkan-v13-experimental-arm64-so \
+            --dir v14-prebuilt > v14-logs/download.txt 2>&1 || {
+              cat v14-logs/download.txt
+              exit 1
+            }
+
+          so='v14-prebuilt/libxbox_d3d8_vk_experimental.so'
+          test -s "$so"
+          ndkbin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$ndkbin/llvm-readelf" -h "$so" > v14-logs/elf-header.txt
+          "$ndkbin/llvm-readelf" -d "$so" > v14-logs/elf-dependencies.txt
+          "$ndkbin/llvm-nm" -D --defined-only "$so" > v14-logs/dynamic-exports.txt
+          grep -q 'AArch64' v14-logs/elf-header.txt
+          for symbol in d3d8_vk_set_host d3d8_vk_set_cache_dir d3d8_format_bpp; do
+            grep -Eq "[[:space:]]${symbol}$" v14-logs/dynamic-exports.txt || {
+              echo "Missing real Xbox Vulkan export: $symbol"
+              exit 1
+            }
+          done
+
+          cp "$so" defjam-v14/app/src/main/jniLibs/arm64-v8a/libxbox_d3d8_vk_experimental.so
+          # The real Shaderc V12B / V13 renderer links the Android NDK shared C++ runtime.
+          # Bundling this is mandatory: the phone doesn't provide libc++_shared.so itself.
+          cpp="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          if [ ! -f "$cpp" ]; then
+            cpp="$ANDROID_NDK_HOME/sources/cxx-stl/llvm-libc++/libs/arm64-v8a/libc++_shared.so"
+          fi
+          test -f "$cpp" || { echo 'Missing NDK libc++_shared.so'; exit 1; }
+          cp "$cpp" defjam-v14/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+          sha256sum "$so" "$cpp" > v14-logs/source-checksums.txt
+          printf '%s\n' 'V14 packages actual V13 renderer; native loader test only.' \
+            'Android JNI calls two side-effect-free Xbox Vulkan configuration functions.' \
+            'Vulkan rendering, shader creation, Xbox emulation and gameplay are NOT tested.' \
+            > v14-logs/scope.txt
+
+      - name: Generate separate V14 Android renderer load-test APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > defjam-v14/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DefJamRealXboxVulkanLoaderV14'
+          include ':app'
+          EOF
+          cat > defjam-v14/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > defjam-v14/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          cat > defjam-v14/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.defjam.rendererprobe'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.defjam.rendererprobe'
+                  minSdk 28
+                  targetSdk 28
+                  versionCode 14
+                  versionName '0.14'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt' } }
+          }
+          EOF
+          cat > defjam-v14/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Def Jam - Renderer V14" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > defjam-v14/app/src/main/java/com/defjam/rendererprobe/MainActivity.java <<'EOF'
+          package com.defjam.rendererprobe;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.widget.TextView;
+          import android.widget.ScrollView;
+
+          public class MainActivity extends Activity {
+              private static native String nativeTestRenderer();
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  TextView text = new TextView(this);
+                  text.setGravity(Gravity.CENTER);
+                  text.setTextSize(19f);
+                  text.setTextColor(Color.WHITE);
+                  text.setPadding(32, 28, 32, 28);
+                  text.setBackgroundColor(Color.rgb(12, 19, 33));
+                  try {
+                      System.loadLibrary("v14probe");
+                      text.setText(nativeTestRenderer());
+                  } catch (Throwable problem) {
+                      text.setText("DEF JAM - V14\n\nERRO NO TESTE NATIVO:\n" + problem.toString());
+                  }
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setFillViewport(true);
+                  scroll.addView(text);
+                  setContentView(scroll);
+              }
+          }
+          EOF
+          cat > defjam-v14/app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(defjam_real_xbox_renderer_loader LANGUAGES C)
+          add_library(v14probe SHARED renderer_probe.c)
+          target_link_libraries(v14probe PRIVATE dl log)
+          target_link_options(v14probe PRIVATE -Wl,--no-undefined)
+          EOF
+          cat > defjam-v14/app/src/main/cpp/renderer_probe.c <<'EOF'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          /* Loads the *real* compiled Xbox Vulkan renderer built in V13.
+             Does not initialize the Xbox GPU, create Vulkan shaders, or run the game. */
+          JNIEXPORT jstring JNICALL
+          Java_com_defjam_rendererprobe_MainActivity_nativeTestRenderer(JNIEnv *env, jclass clazz) {
+              (void)clazz;
+              char result[1600] = {0};
+              const char *library = "libxbox_d3d8_vk_experimental.so";
+              dlerror();
+              void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+              if (!handle) {
+                  const char *why = dlerror();
+                  snprintf(result, sizeof(result),
+                           "DEF JAM - RENDERIZADOR V14\n\n"
+                           "Biblioteca Xbox Vulkan: FALHOU\n\n"
+                           "Detalhe: %s\n\n"
+                           "Teste de carregamento, nao e o jogo.",
+                           why ? why : "Erro desconhecido");
+                  return (*env)->NewStringUTF(env, result);
+              }
+
+              /* These symbols belong to genuine xboxrecomp/src/d3d/d3d8_vk.c.
+                 Invoking NULL config setters is safe without a Vulkan context. */
+              void (*set_host)(const void *) = (void (*)(const void *))dlsym(handle, "d3d8_vk_set_host");
+              void (*set_cache)(const char *) = (void (*)(const char *))dlsym(handle, "d3d8_vk_set_cache_dir");
+              void *format = dlsym(handle, "d3d8_format_bpp");
+              if (set_host) set_host(NULL);
+              if (set_cache) set_cache(NULL);
+              snprintf(result, sizeof(result),
+                       "DEF JAM - RENDERIZADOR V14\n\n"
+                       "Android ARM64 - codigo Xbox real\n\n"
+                       "Carregamento .so: PASSOU\n"
+                       "d3d8_vk_set_host: %s\n"
+                       "d3d8_vk_set_cache_dir: %s\n"
+                       "d3d8_format_bpp: %s\n\n"
+                       "SO TESTE DE CARREGAMENTO E FUNCOES DE CONFIGURACAO.\n"
+                       "Ainda nao existe renderizacao Xbox ou gameplay.",
+                       set_host ? "PASSOU" : "FALHOU",
+                       set_cache ? "PASSOU" : "FALHOU",
+                       format ? "ENCONTRADA" : "NAO ENCONTRADA");
+              return (*env)->NewStringUTF(env, result);
+          }
+          EOF
+
+      - name: Build and verify V14 APK with real renderer shared object
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v14 :app:assembleDebug --no-daemon --stacktrace \
+            > v14-logs/gradle-build.log 2>&1 || {
+              tail -n 120 v14-logs/gradle-build.log
+              exit 1
+            }
+          apk='defjam-v14/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk"
+          unzip -l "$apk" > v14-logs/apk-contents.txt
+          for name in libxbox_d3d8_vk_experimental.so libc++_shared.so libv14probe.so; do
+            grep -Fq "lib/arm64-v8a/$name" v14-logs/apk-contents.txt || {
+              echo "Missing APK library: $name"
+              exit 1
+            }
+          done
+          sha256sum "$apk" > v14-logs/apk-checksum.txt
+          du -h "$apk"
+          echo 'PASS: V14 APK contains real V13 Xbox renderer, C++ runtime and JNI test.'
+
+      - name: Upload V14 real renderer loader APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v14-real-xbox-renderer-loader-apk
+          path: defjam-v14/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload V14 diagnostics even on build failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v14-renderer-loader-build-report
+          path: v14-logs/
+          if-no-files-found: warn
