@@ -1,0 +1,233 @@
+name: Def Jam - V8 Xbox memory mapping on Android
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-runtime-v8.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-xbox-kernel-module:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout project and Xbox recompilation toolkit
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reuse V7C steps to prepare isolated native module
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          src = Path('.github/workflows/android-runtime-v7c.yml').read_text(encoding='utf-8')
+          headings = [
+            'Apply verified V6 compatibility workarounds to temporary checkout',
+            'Generate V7 native Android activity and JNI test source',
+            'Restrict native test to real crypto module and POSIX compatibility layer',
+          ]
+          for n, name in enumerate(headings, 1):
+              header = '      - name: ' + name + '\n'
+              if src.count(header) != 1:
+                  raise SystemExit('Missing or repeated V7C step: ' + name)
+              a = src.index('        run: |\n', src.index(header)) + len('        run: |\n')
+              b = src.find('\n      - name: ', a)
+              if b < 0:
+                  b = len(src)
+              block = src[a:b].splitlines(keepends=True)
+              lines = []
+              for line in block:
+                  if not line.strip():
+                      lines.append('\n')
+                  elif line.startswith('          '):
+                      lines.append(line[10:])
+                  else:
+                      raise SystemExit('Invalid indentation in V7C: ' + repr(line))
+              path = Path('/tmp/defjam-v7e-stage-%d.sh' % n)
+              path.write_text('set -euo pipefail\n' + ''.join(lines), encoding='utf-8')
+              print('Running stage:', name, flush=True)
+              subprocess.run(['bash', str(path)], check=True)
+          PY
+
+      - name: Supply genuine runtime logging dependency for isolated test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-v7/app/src/main/cpp
+          cat > android-v7/app/src/main/cpp/xbox_test_logger.cpp <<'EOF'
+          // Minimal logger for the isolated kernel-crypto test ONLY.
+          // This is not a replacement for the game's full logging/runtime system.
+          #include <cstdarg>
+          #include <cstdio>
+          extern "C" void xbox_log(int level, const char* subsystem, const char* fmt, ...) {
+              (void)level;
+              std::fprintf(stderr, "[Xbox test %s] ", subsystem ? subsystem : "runtime");
+              va_list args;
+              va_start(args, fmt);
+              std::vfprintf(stderr, fmt, args);
+              va_end(args);
+              std::fputc('\n', stderr);
+          }
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('android-v7/app/src/main/cpp/CMakeLists.txt')
+          s = path.read_text(encoding='utf-8')
+          old = 'add_library(xboxkerneltest SHARED xbox_kernel_test.cpp "${XBOXRECOMP_ROOT}/src/kernel/kernel_crypto.c")'
+          new = 'add_library(xboxkerneltest SHARED xbox_kernel_test.cpp xbox_test_logger.cpp "${XBOXRECOMP_ROOT}/src/kernel/kernel_crypto.c")'
+          if s.count(old) != 1:
+              raise SystemExit('Expected isolated crypto library declaration not found')
+          path.write_text(s.replace(old, new, 1), encoding='utf-8')
+          print('Added a test-only implementation of xbox_log for the isolated crypto module.')
+          PY
+
+      - name: Add host Xbox memory tests using real platform APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYMEM'
+          from pathlib import Path
+          cpp = Path('android-v7/app/src/main/cpp/xbox_kernel_test.cpp')
+          assert cpp.exists(), 'V7E generated JNI file missing'
+          cpp.write_text(r'''#include <jni.h>
+          #include <cstdio>
+          #include <cstring>
+          #include "kernel.h"
+          #include "win32_compat.h"
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_defjam_kerneltest_MainActivity_nativeXboxKernelTest(JNIEnv *env, jclass) {
+              // This is genuine Xbox kernel HLE cryptography and Win32/POSIX host
+              // compatibility code, not a recompiled Def Jam game executable.
+              XBOX_SHA_CONTEXT ctx{};
+              const unsigned char sample[] = {'a','b','c'};
+              unsigned char digest[20]{};
+              const unsigned char expected[20] = {
+                  0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
+                  0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d
+              };
+              xbox_XcSHAInit(&ctx);
+              xbox_XcSHAUpdate(&ctx, sample, 3);
+              xbox_XcSHAFinal(&ctx, digest);
+              const bool sha = std::memcmp(digest, expected, sizeof(expected)) == 0;
+              SetLastError(73);
+              const bool lastError = GetLastError() == 73;
+
+              // 4 MiB private reservation with reads/writes at both ends.
+              constexpr SIZE_T kAllocation = 4u * 1024u * 1024u;
+              auto *privateMem = static_cast<unsigned char *>(
+                  VirtualAlloc(nullptr, kAllocation, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+              bool allocation = false;
+              bool query = false;
+              if (privateMem) {
+                  privateMem[0] = 0x51;
+                  privateMem[kAllocation - 1] = 0xa2;
+                  allocation = privateMem[0] == 0x51 && privateMem[kAllocation - 1] == 0xa2;
+                  MEMORY_BASIC_INFORMATION info{};
+                  query = VirtualQuery(privateMem + 128, &info, sizeof(info)) == sizeof(info)
+                      && info.AllocationBase == privateMem && info.State == MEM_COMMIT;
+              }
+              bool freedPrivate = privateMem && VirtualFree(privateMem, 0, MEM_RELEASE);
+
+              // Xbox-retail-sized 64 MiB file-backed mapping. Mapping two separate
+              // 64 KiB windows at offset zero checks that they alias the SAME bytes.
+              // This does not yet map all the Xbox address-space mirrors.
+              constexpr DWORD kXboxMemory = 64u * 1024u * 1024u;
+              constexpr SIZE_T kWindow = 64u * 1024u;
+              HANDLE region = CreateFileMappingA(nullptr, nullptr, PAGE_READWRITE,
+                                                  0, kXboxMemory, nullptr);
+              auto *view1 = region ? static_cast<unsigned char *>(
+                  MapViewOfFile(region, FILE_MAP_ALL_ACCESS, 0, 0, kWindow)) : nullptr;
+              auto *view2 = region ? static_cast<unsigned char *>(
+                  MapViewOfFile(region, FILE_MAP_ALL_ACCESS, 0, 0, kWindow)) : nullptr;
+              bool aliases = false;
+              if (view1 && view2) {
+                  view1[0] = 0x12;
+                  view1[kWindow - 1] = 0x34;
+                  aliases = view2[0] == 0x12 && view2[kWindow - 1] == 0x34;
+              }
+              const bool unmapped1 = !view1 || UnmapViewOfFile(view1);
+              const bool unmapped2 = !view2 || UnmapViewOfFile(view2);
+              const bool closed = !region || CloseHandle(region);
+              const bool cleanup = freedPrivate && unmapped1 && unmapped2 && closed;
+              const bool fileMapping = region != nullptr && view1 && view2;
+
+              char result[850];
+              std::snprintf(result, sizeof(result),
+                  "DEF JAM - XBOX MEMORY V8\n\n"
+                  "Android ARM64 / xboxrecomp real\n\n"
+                  "Xbox SHA-1: %s\n"
+                  "GetLastError: %s\n"
+                  "VirtualAlloc 4 MiB: %s\n"
+                  "VirtualQuery: %s\n"
+                  "64 MiB file mapping: %s\n"
+                  "Duas visoes da memoria: %s\n"
+                  "Liberacao de memoria: %s\n\n"
+                  "Teste de memoria HOST. Nao e o jogo.\n"
+                  "Memoria Xbox completa e graficos ainda nao portados.",
+                  sha ? "PASSOU" : "FALHOU",
+                  lastError ? "PASSOU" : "FALHOU",
+                  allocation ? "PASSOU" : "FALHOU",
+                  query ? "PASSOU" : "FALHOU",
+                  fileMapping ? "PASSOU" : "FALHOU",
+                  aliases ? "PASSOU" : "FALHOU",
+                  cleanup ? "PASSOU" : "FALHOU");
+              return env->NewStringUTF(result);
+          }
+          ''', encoding='utf-8')
+
+          # Preserve the Java class/package name, but install V8 separately
+          # from the successful V7E test app.
+          gradle = Path('android-v7/app/build.gradle')
+          g = gradle.read_text(encoding='utf-8')
+          assert "applicationId 'com.defjam.kerneltest'" in g
+          g = g.replace("applicationId 'com.defjam.kerneltest'",
+                        "applicationId 'com.defjam.memorytest'")
+          g = g.replace('versionCode 7', 'versionCode 8')
+          g = g.replace("versionName '0.7c'", "versionName '0.8'")
+          g = g.replace("versionName '0.7'", "versionName '0.8'")
+          gradle.write_text(g, encoding='utf-8')
+          manifest = Path('android-v7/app/src/main/AndroidManifest.xml')
+          m = manifest.read_text(encoding='utf-8')
+          assert 'android:name=".MainActivity"' in m
+          m = m.replace('android:name=".MainActivity"',
+                        'android:name="com.defjam.kerneltest.MainActivity"')
+          m = m.replace('Def Jam - Xbox Kernel V7', 'Def Jam - Xbox Memory V8')
+          manifest.write_text(m, encoding='utf-8')
+          print('V8 native RAM/file-mapping tests written; V7E untouched.')
+          PYMEM
+
+      - name: Build Xbox memory mapping V8 APK
+        shell: bash
+        run: gradle -p android-v7 :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Confirm native ARM64 library inside APK
+        shell: bash
+        run: |
+          unzip -l android-v7/app/build/outputs/apk/debug/app-debug.apk | grep -F 'lib/arm64-v8a/libxboxkerneltest.so'
+
+      - name: Upload V8 memory test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-xbox-memory-v8-apk
+          path: android-v7/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
