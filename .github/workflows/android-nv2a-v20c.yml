@@ -1,0 +1,187 @@
+name: Def Jam - V20C fix Android NV2A library dependency path
+
+'on':
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-nv2a-v20c.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  nv2a-android-loader-fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout Xbox runtime and proven workflows
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Recreate successful V20B source and bundled real Xbox libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYREUSE'
+          from pathlib import Path
+          import subprocess
+          prior=Path('.github/workflows/android-nv2a-v20b.yml').read_text(encoding='utf-8')
+          stages=[
+              'Rebuild V16 and include authentic V19 NV2A library',
+              'Correct V20 patch and add authentic NV2A header path',
+          ]
+          for number,name in enumerate(stages,1):
+              marker='      - name: '+name+'\n'
+              assert prior.count(marker)==1, 'V20B stage missing: '+name
+              begin=prior.index('        run: |\n',prior.index(marker))+len('        run: |\n')
+              end=prior.find('\n      - name: ',begin)
+              if end<0: end=len(prior)
+              lines=[]
+              for line in prior[begin:end].splitlines(keepends=True):
+                  if not line.strip(): lines.append('\n')
+                  elif line.startswith('          '): lines.append(line[10:])
+                  else: raise RuntimeError('Unexpected V20B indentation: '+repr(line))
+              script=Path('/tmp/defjam-v20c-reuse-'+str(number)+'.sh')
+              script.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+              subprocess.run(['bash','-n',str(script)],check=True)
+              print('Running proven V20B stage:',name,flush=True)
+              subprocess.run(['bash',str(script)],check=True)
+          PYREUSE
+
+      - name: Repair real NV2A ELF DT_NEEDED and verify no temporary GitHub paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p v20c-logs
+          so=defjam-v15/app/src/main/jniLibs/arm64-v8a/libxbox_nv2a_vulkan_v19.so
+          renderer=defjam-v15/app/src/main/jniLibs/arm64-v8a/libxbox_d3d8_vk_experimental.so
+          test -s "$so"
+          test -s "$renderer"
+          if ! command -v patchelf >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq patchelf
+          fi
+          original='v19-renderer/libxbox_d3d8_vk_experimental.so'
+          fixed='libxbox_d3d8_vk_experimental.so'
+          patchelf --print-needed "$so" | tee v20c-logs/nv2a-needed-before.txt
+          if grep -Fxq "$original" v20c-logs/nv2a-needed-before.txt; then
+            patchelf --replace-needed "$original" "$fixed" "$so"
+            echo 'Replaced erroneous DT_NEEDED path with Android library soname.'
+          elif grep -Fxq "$fixed" v20c-logs/nv2a-needed-before.txt; then
+            echo 'NV2A already references correct Android renderer name.'
+          else
+            echo 'Unexpected renderer dependency: refusing silent patch.' >&2
+            exit 1
+          fi
+          patchelf --print-needed "$so" | tee v20c-logs/nv2a-needed-after.txt
+          grep -Fxq "$fixed" v20c-logs/nv2a-needed-after.txt
+          if grep -Fq "$original" v20c-logs/nv2a-needed-after.txt; then
+            echo 'Original invalid path remains.' >&2
+            exit 1
+          fi
+          if grep -q '/' v20c-logs/nv2a-needed-after.txt; then
+            echo 'Another DT_NEEDED contains a file-system path.' >&2
+            exit 1
+          fi
+          ndkbin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$ndkbin/llvm-readelf" -h "$so" | tee v20c-logs/nv2a-elf-header.txt
+          "$ndkbin/llvm-readelf" -d "$so" | tee v20c-logs/nv2a-elf-dynamic.txt
+          grep -q AArch64 v20c-logs/nv2a-elf-header.txt
+          grep -Fq "Shared library: [$fixed]" v20c-logs/nv2a-elf-dynamic.txt
+          sha256sum "$so" > v20c-logs/patched-nv2a-sha256.txt
+          echo 'V20C PASS: Genuine NV2A library has a valid Android renderer dependency.'
+
+      - name: Mark corrected test as V20C and avoid replacing V20B installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYPATCH'
+          from pathlib import Path
+          base=Path('defjam-v15')
+          gradle=base/'app/build.gradle'
+          g=gradle.read_text(encoding='utf-8')
+          assert "applicationId 'com.defjam.nv2apgraphv20'" in g
+          assert 'versionCode 20' in g
+          g=g.replace("applicationId 'com.defjam.nv2apgraphv20'",
+                      "applicationId 'com.defjam.nv2apgraphv20c'")
+          g=g.replace('versionCode 20','versionCode 21')
+          g=g.replace("versionName '0.20'","versionName '0.20.3'")
+          gradle.write_text(g,encoding='utf-8')
+          manifest=base/'app/src/main/AndroidManifest.xml'
+          m=manifest.read_text(encoding='utf-8')
+          assert 'Def Jam - Tradutor NV2A V20' in m
+          manifest.write_text(m.replace('Def Jam - Tradutor NV2A V20',
+                                         'Def Jam - Tradutor NV2A V20C'),encoding='utf-8')
+          java=base/'app/src/main/java/com/defjam/rendererprobe/MainActivity.java'
+          j=java.read_text(encoding='utf-8')
+          java.write_text(j.replace('V20','V20C'),encoding='utf-8')
+          native=base/'app/src/main/cpp/renderer_probe.c'
+          s=native.read_text(encoding='utf-8')
+          s=s.replace('V20:', 'V20C:')
+          s=s.replace('NV2A XBOX V20','NV2A XBOX V20C')
+          native.write_text(s,encoding='utf-8')
+          print('V20C standalone Android test with original NV2A + real Vulkan backend.')
+          PYPATCH
+
+      - name: Build Android APK and check actual packaged ELF dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v15 :app:assembleDebug --no-daemon --stacktrace \
+            > v20c-logs/gradle-build.log 2>&1 || {
+              tail -n 150 v20c-logs/gradle-build.log
+              exit 1
+            }
+          apk=defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          unzip -l "$apk" > v20c-logs/apk-contents.txt
+          for name in libxbox_nv2a_vulkan_v19.so libxbox_d3d8_vk_experimental.so libc++_shared.so libv20probe.so; do
+            grep -Fq "lib/arm64-v8a/$name" v20c-logs/apk-contents.txt || {
+              echo "Missing Android ARM64 library $name" >&2
+              exit 1
+            }
+          done
+          unzip -p "$apk" lib/arm64-v8a/libxbox_nv2a_vulkan_v19.so > v20c-logs/apk-packaged-nv2a.so
+          patchelf --print-needed v20c-logs/apk-packaged-nv2a.so > v20c-logs/apk-packaged-nv2a-needed.txt
+          grep -Fxq 'libxbox_d3d8_vk_experimental.so' v20c-logs/apk-packaged-nv2a-needed.txt
+          if grep -q '/' v20c-logs/apk-packaged-nv2a-needed.txt; then
+            echo 'Invalid path in packaged DT_NEEDED.' >&2
+            exit 1
+          fi
+          # Gradle may strip harmless debug symbols; validate the dynamic dependency instead.
+          rm v20c-logs/apk-packaged-nv2a.so
+          sha256sum "$apk" > v20c-logs/apk-sha256.txt
+          du -h "$apk"
+          echo 'V20C PASS: APK packaged corrected real NV2A ARM64 ELF dependency.'
+          echo 'WARNING: NV2A drawing on Galaxy M55 has not been tested yet.'
+
+      - name: Upload corrected V20C NV2A GPU APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v20c-fixed-nv2a-loader-apk
+          path: defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload V20C dependency and build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v20c-nv2a-loader-repair-report
+          path: v20c-logs/
+          if-no-files-found: warn
