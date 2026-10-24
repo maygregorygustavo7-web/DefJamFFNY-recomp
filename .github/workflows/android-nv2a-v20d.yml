@@ -1,0 +1,297 @@
+name: Def Jam - V20D NV2A native crash checkpoint diagnostics
+
+'on':
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-nv2a-v20d.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  nv2a-crash-checkpoints:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout Xbox source and previous working workflow
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reconstruct V20C native project and real NV2A loader fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYREUSE'
+          from pathlib import Path
+          import subprocess
+          source=Path('.github/workflows/android-nv2a-v20c.yml').read_text(encoding='utf-8')
+          steps=[
+              'Recreate successful V20B source and bundled real Xbox libraries',
+              'Repair real NV2A ELF DT_NEEDED and verify no temporary GitHub paths',
+              'Mark corrected test as V20C and avoid replacing V20B installation',
+          ]
+          for i,name in enumerate(steps,1):
+              marker='      - name: '+name+'\n'
+              assert source.count(marker)==1,'Missing V20C stage: '+name
+              start=source.index('        run: |\n',source.index(marker))+len('        run: |\n')
+              end=source.find('\n      - name: ',start)
+              if end<0:end=len(source)
+              lines=[]
+              for line in source[start:end].splitlines(keepends=True):
+                  if not line.strip():lines.append('\n')
+                  elif line.startswith('          '):lines.append(line[10:])
+                  else:raise RuntimeError('Unexpected YAML indentation '+repr(line))
+              sh=Path(f'/tmp/defjam-v20d-reuse-{i}.sh')
+              sh.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+              subprocess.run(['bash','-n',str(sh)],check=True)
+              print('Reusing:',name,flush=True)
+              subprocess.run(['bash',str(sh)],check=True)
+          PYREUSE
+
+      - name: Insert native checkpoint recorder and persistent on-screen diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p v20d-logs
+          python3 - <<'PYDIAG'
+          from pathlib import Path
+          root=Path('defjam-v15')
+          native=root/'app/src/main/cpp/renderer_probe.c'
+          src=native.read_text(encoding='utf-8')
+          anchor='#include "nv2a_pgraph_d3d11.h"'
+          assert src.count(anchor)==1, 'Expected original PGRAPH include'
+          injection=r'''
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/types.h>
+          #include <sys/stat.h>
+
+          /* Each checkpoint is synchronously stored in app-private storage.
+             After SIGSEGV/driver crash, the next launch shows the last stage. */
+          static char v20d_trace_path[1024];
+          static void v20d_checkpoint(const char *stage) {
+              __android_log_print(ANDROID_LOG_INFO, "DefJamNV2ADiag", "%s",stage);
+              if (!v20d_trace_path[0]) return;
+              int fd=open(v20d_trace_path,O_WRONLY|O_CREAT|O_TRUNC,0600);
+              if (fd>=0) {
+                  size_t n=strlen(stage);
+                  (void)write(fd,stage,n);
+                  (void)write(fd,"\n",1);
+                  (void)fsync(fd);
+                  (void)close(fd);
+              }
+          }
+          JNIEXPORT void JNICALL
+          Java_com_defjam_rendererprobe_MainActivity_nativeSetTrace(JNIEnv *env,jclass cls,jstring path) {
+              (void)cls;
+              if (!path) return;
+              const char *p=(*env)->GetStringUTFChars(env,path,NULL);
+              if (p) {
+                  snprintf(v20d_trace_path,sizeof(v20d_trace_path),"%s",p);
+                  (*env)->ReleaseStringUTFChars(env,path,p);
+              }
+          }
+          '''
+          src=src.replace(anchor,anchor+'\n'+injection)
+          markers=[
+              ('const int W = 320, H = 240;', '01 - JNI iniciou o teste; GPU ainda nao inicializada'),
+              ('void *lib = dlopen("libxbox_d3d8_vk_experimental.so", RTLD_NOW | RTLD_LOCAL);', '02 - Carregando biblioteca Vulkan original'),
+              ('IDirect3D8 *(*make_d3d)', '03 - Vulkan carregado, procurando interface D3D8'),
+              ('IDirect3D8 *d3d = make_d3d(0);','04 - Criando interface D3D8'),
+              ('HRESULT created = d3d->lpVtbl->CreateDevice', '05 - Chamando CreateDevice Vulkan'),
+              ('const DWORD navy = 0xFF183250u;', '06 - Dispositivo Vulkan criado'),
+              ('HRESULT cleared = dev->lpVtbl->Clear', '07 - Chamando Clear da GPU'),
+              ('void *nv2alib = dlopen("libxbox_nv2a_vulkan_v19.so", RTLD_NOW | RTLD_LOCAL);', '08 - Carregando biblioteca NV2A real'),
+              ('void (*pgraph_init)(void)', '09 - NV2A carregado, procurando funcoes PGRAPH'),
+              ('pgraph_init();', '10 - Chamando inicializacao PGRAPH'),
+              ('const PgraphReadyVertex verts[3]', '11 - PGRAPH inicializado, criando vertices'),
+              ('pgraph_draw(5, verts, 3);','12 - Chamando NV2A pgraph_draw_ready'),
+              ('PgraphD3D11Stats stats = {0};','13 - pgraph_draw_ready retornou'),
+              ('pgraph_stats(&stats);','14 - Lendo estatisticas NV2A'),
+              ('HRESULT drew=(stats.draw_calls==1','15 - Estatisticas NV2A retornaram'),
+              ('IDirect3DSurface8 *back = NULL;', '16 - Acessando backbuffer Vulkan'),
+              ('HRESULT backres = dev->lpVtbl->GetBackBuffer','17 - Chamando GetBackBuffer'),
+              ('HRESULT readres = back->lpVtbl->LockRect','18 - Chamando LockRect (leitura GPU)'),
+              ('jintArray image = (*env)->NewIntArray','19 - GPU readback completo; criando buffer Java'),
+              ('(*env)->SetIntArrayRegion(env, image, 0, W*H, pixels);','20 - Copiando pixels GPU para Java'),
+              ('return image;', '21 - SUCESSO: NV2A retornou imagem para Android'),
+          ]
+          for needle,stage in markers:
+              count=src.count(needle)
+              if count!=1:raise RuntimeError(f'Expected 1 native marker {needle!r}, found {count}')
+              src=src.replace(needle,f'v20d_checkpoint("{stage}");\n              '+needle,1)
+          native.write_text(src,encoding='utf-8')
+
+          java=root/'app/src/main/java/com/defjam/rendererprobe/MainActivity.java'
+          java.write_text(r'''package com.defjam.rendererprobe;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import java.io.File;
+          import java.nio.file.Files;
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends Activity {
+              private static native void nativeSetTrace(String path);
+              private static native int[] nativeRenderPixels();
+              private static native String nativeLastReport();
+              private File trace;
+              private TextView status;
+              private ImageView preview;
+              private boolean ready=false;
+
+              private String lastStep() {
+                  try {
+                      if (!trace.exists()) return "Nenhum teste iniciado nesta versao.";
+                      return new String(Files.readAllBytes(trace.toPath()),StandardCharsets.UTF_8).trim();
+                  } catch (Throwable ex) { return "Erro lendo diagnostico: " + ex; }
+              }
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  trace=new File(getFilesDir(),"v20d-last-step.txt");
+                  ScrollView scroll=new ScrollView(this);
+                  LinearLayout root=new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(22,18,22,25);
+                  root.setBackgroundColor(Color.rgb(11,19,34));
+                  status=new TextView(this);
+                  status.setTextColor(Color.WHITE);
+                  status.setTextSize(16f);
+                  status.setGravity(Gravity.CENTER);
+                  status.setText("DEF JAM - DIAGNOSTICO NV2A V20D\n\nUltima etapa salva:\n"+lastStep()
+                      +"\n\nSe o app fechar, reabra: a ultima etapa sera mostrada aqui.");
+                  root.addView(status);
+                  Button test=new Button(this);
+                  test.setText("TESTAR NV2A COM DIAGNOSTICO");
+                  root.addView(test);
+                  Button copy=new Button(this);
+                  copy.setText("COPIAR ULTIMA ETAPA");
+                  root.addView(copy);
+                  preview=new ImageView(this);
+                  preview.setAdjustViewBounds(true);
+                  preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  preview.setBackgroundColor(Color.rgb(4,8,16));
+                  root.addView(preview,new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,430));
+                  scroll.addView(root);
+                  setContentView(scroll);
+                  try {System.loadLibrary("v20probe");ready=true;}
+                  catch (Throwable error) {
+                      status.setText("Falhou ao carregar JNI:\n" + error + "\nUltimo passo:\n"+lastStep());
+                      test.setEnabled(false);
+                  }
+                  copy.setOnClickListener(v -> {
+                      ClipboardManager cm=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+                      if (cm!=null) cm.setPrimaryClip(ClipData.newPlainText("Diagnostico NV2A V20D",lastStep()));
+                      status.setText("Diagnostico copiado.\n\nUltima etapa:\n"+lastStep());
+                  });
+                  test.setOnClickListener(v -> {
+                      if (!ready)return;
+                      test.setEnabled(false);
+                      try {Files.write(trace.toPath(),"00 - Iniciando teste Java".getBytes(StandardCharsets.UTF_8));}
+                      catch(Throwable ignored){}
+                      status.setText("Executando teste NV2A...\nSe fechar, reabra este aplicativo para ver a ultima etapa salva.");
+                      new Thread(() -> {
+                          int[] pixels=null;
+                          String report;
+                          try {
+                              nativeSetTrace(trace.getAbsolutePath());
+                              pixels=nativeRenderPixels();
+                              report=nativeLastReport();
+                          } catch(Throwable e) {report="Erro JNI:\n"+e;}
+                          final int[] out=pixels;
+                          final String message=report;
+                          runOnUiThread(() -> {
+                              status.setText(message+"\n\nULTIMA ETAPA:\n"+lastStep());
+                              if (out!=null && out.length==320*240) {
+                                  Bitmap b=Bitmap.createBitmap(320,240,Bitmap.Config.ARGB_8888);
+                                  b.setPixels(out,0,320,0,0,320,240);
+                                  preview.setImageBitmap(b);
+                              }
+                              test.setText("TESTE FINALIZADO");
+                          });
+                      },"DefJamV20D-NativeDiagnostics").start();
+                  });
+              }
+          }
+          '''.replace('          ','').lstrip(),encoding='utf-8')
+
+          gradle=root/'app/build.gradle'
+          g=gradle.read_text(encoding='utf-8')
+          assert "applicationId 'com.defjam.nv2apgraphv20c'" in g
+          assert 'versionCode 21' in g
+          g=g.replace('com.defjam.nv2apgraphv20c','com.defjam.nv2apgraphv20d')
+          g=g.replace('versionCode 21','versionCode 22')
+          g=g.replace("versionName '0.20.3'","versionName '0.20.4'")
+          gradle.write_text(g,encoding='utf-8')
+          manifest=root/'app/src/main/AndroidManifest.xml'
+          m=manifest.read_text(encoding='utf-8')
+          assert 'Def Jam - Tradutor NV2A V20C' in m
+          manifest.write_text(m.replace('Def Jam - Tradutor NV2A V20C',
+                                        'Def Jam - Diagnostico NV2A V20D'),encoding='utf-8')
+          print('Native checkpoint diagnostic with on-relaunch crash recovery generated')
+          PYDIAG
+
+      - name: Build and validate V20D ARM64 diagnostic APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v15 :app:assembleDebug --no-daemon --stacktrace > v20d-logs/gradle-build.log 2>&1 || {
+            tail -n 160 v20d-logs/gradle-build.log
+            exit 1
+          }
+          apk=defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          unzip -l "$apk" > v20d-logs/apk-contents.txt
+          for lib in libxbox_nv2a_vulkan_v19.so libxbox_d3d8_vk_experimental.so libc++_shared.so libv20probe.so; do
+            grep -Fq "lib/arm64-v8a/$lib" v20d-logs/apk-contents.txt || { echo "Missing library $lib"; exit 1; }
+          done
+          unzip -p "$apk" lib/arm64-v8a/libxbox_nv2a_vulkan_v19.so > /tmp/v20d-packaged-nv2a.so
+          patchelf --print-needed /tmp/v20d-packaged-nv2a.so > v20d-logs/packed-nv2a-needed.txt
+          grep -Fxq libxbox_d3d8_vk_experimental.so v20d-logs/packed-nv2a-needed.txt
+          if grep -q '/' v20d-logs/packed-nv2a-needed.txt; then echo 'Invalid ELF dynamic library path'; exit 1; fi
+          sha256sum "$apk" > v20d-logs/apk-sha256.txt
+          echo 'V20D compiled: checkpoints persist after native crash; on-device behavior not yet verified.'
+
+      - name: Publish V20D native crash checkpoint APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v20d-nv2a-crash-diagnostics-apk
+          path: defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish V20D build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v20d-native-crash-build-report
+          path: v20d-logs/
+          if-no-files-found: warn
