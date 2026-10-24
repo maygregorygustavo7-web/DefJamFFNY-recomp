@@ -1,0 +1,329 @@
+name: Def Jam - V16 real Xbox D3D8 Vulkan drawing and GPU pixel readback
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-renderer-v16.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  xbox-d3d8-offscreen-drawing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout Xbox recompilation project and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reuse validated V15 Android GPU project and authentic renderer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYREUSE'
+          from pathlib import Path
+          import subprocess
+          src=Path('.github/workflows/android-renderer-v15.yml').read_text(encoding='utf-8')
+          steps=[
+              'Reuse V13 real ARM64 Xbox Vulkan renderer and NDK C++ library',
+              'Generate V15 Gradle project and app metadata',
+              'Generate V15 interactive Android headless Xbox GPU initialization app',
+          ]
+          for number, name in enumerate(steps,1):
+              heading='      - name: '+name+'\n'
+              if src.count(heading)!=1: raise SystemExit('V15 step missing or duplicated: '+name)
+              a=src.index('        run: |\n',src.index(heading))+len('        run: |\n')
+              b=src.find('\n      - name: ',a)
+              if b<0: b=len(src)
+              lines=[]
+              for line in src[a:b].splitlines(keepends=True):
+                  if not line.strip(): lines.append('\n')
+                  elif line.startswith('          '): lines.append(line[10:])
+                  else: raise SystemExit('Wrong indent from V15: '+repr(line))
+              p=Path('/tmp/v16-reuse-%d.sh'%number)
+              p.write_text('set -euo pipefail\n'+''.join(lines),encoding='utf-8')
+              subprocess.run(['bash','-n',str(p)],check=True)
+              print('Reusing verified V15 stage:',name,flush=True)
+              subprocess.run(['bash',str(p)],check=True)
+          PYREUSE
+
+      - name: Generate V16 offscreen GPU draw and pixel readback test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > defjam-v15/app/src/main/cpp/renderer_probe.c <<'EOFC'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <android/log.h>
+          #include "d3d8_xbox.h"
+
+          /* REAL xboxrecomp D3D8-to-Vulkan offscreen render test, not game code. */
+          static char g_report[1400] = "V16 ainda nao executada.";
+
+          JNIEXPORT jstring JNICALL
+          Java_com_defjam_rendererprobe_MainActivity_nativeLastReport(JNIEnv *env, jclass cls) {
+              (void)cls;
+              return (*env)->NewStringUTF(env, g_report);
+          }
+
+          JNIEXPORT jintArray JNICALL
+          Java_com_defjam_rendererprobe_MainActivity_nativeRenderPixels(JNIEnv *env, jclass cls) {
+              (void)cls;
+              const int W = 320, H = 240;
+              void *lib = dlopen("libxbox_d3d8_vk_experimental.so", RTLD_NOW | RTLD_LOCAL);
+              if (!lib) {
+                  const char *why = dlerror();
+                  snprintf(g_report, sizeof g_report, "V16: FALHOU AO CARREGAR RENDERIZADOR\n%s", why ? why : "erro desconhecido");
+                  return (*env)->NewIntArray(env, 0);
+              }
+
+              IDirect3D8 *(*make_d3d)(UINT) = (IDirect3D8 *(*)(UINT))dlsym(lib, "xbox_Direct3DCreate8");
+              void (*set_host)(const void *) = (void (*)(const void *))dlsym(lib, "d3d8_vk_set_host");
+              void (*set_cache)(const char *) = (void (*)(const char *))dlsym(lib, "d3d8_vk_set_cache_dir");
+              if (!make_d3d || !set_host || !set_cache) {
+                  snprintf(g_report, sizeof g_report, "V16: FALHOU: exportacoes D3D8 incompletas");
+                  return (*env)->NewIntArray(env, 0);
+              }
+
+              set_host(NULL); /* offscreen, no separate Vulkan demo or UI surface */
+              set_cache(NULL);
+              IDirect3D8 *d3d = make_d3d(0);
+              if (!d3d || !d3d->lpVtbl || !d3d->lpVtbl->CreateDevice) {
+                  snprintf(g_report, sizeof g_report, "V16: FALHOU: interface D3D8 indisponivel");
+                  return (*env)->NewIntArray(env, 0);
+              }
+
+              D3DPRESENT_PARAMETERS pp;
+              memset(&pp, 0, sizeof pp);
+              pp.BackBufferWidth = W;
+              pp.BackBufferHeight = H;
+              pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+              pp.BackBufferCount = 1;
+              pp.Windowed = 1;
+              IDirect3DDevice8 *dev = NULL;
+              HRESULT created = d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &dev);
+              if (created != 0 || !dev || !dev->lpVtbl) {
+                  snprintf(g_report, sizeof g_report, "V16: FALHOU EM CreateDevice: 0x%08X", (unsigned)created);
+                  return (*env)->NewIntArray(env, 0);
+              }
+
+              const DWORD navy = 0xFF183250u;
+              HRESULT cleared = dev->lpVtbl->Clear(dev, 0, NULL, D3DCLEAR_TARGET, navy, 1.0f, 0);
+              /* Each vertex: x,y,z,rhw, ARGB color, u,v = 28 bytes. */
+              struct Vtx { float x,y,z,rhw; uint32_t color; float u,v; };
+              const struct Vtx verts[3] = {
+                  {160.f, 26.f, 0.5f, 1.f, 0xFFFF4E42u, 0.f, 0.f},
+                  { 54.f,210.f, 0.5f, 1.f, 0xFFFF4E42u, 0.f, 0.f},
+                  {266.f,210.f, 0.5f, 1.f, 0xFFFF4E42u, 0.f, 0.f}
+              };
+              _Static_assert(sizeof(struct Vtx) == 28, "Expected real xboxrecomp 28-byte D3D8 vertex");
+              HRESULT drew = dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, verts, sizeof(struct Vtx));
+
+              IDirect3DSurface8 *back = NULL;
+              HRESULT backres = dev->lpVtbl->GetBackBuffer(dev, 0, 0, &back);
+              if (backres != 0 || !back || !back->lpVtbl) {
+                  snprintf(g_report, sizeof g_report, "V16: Clear=0x%08X; Triangulo=0x%08X; GetBackBuffer FALHOU 0x%08X",
+                           (unsigned)cleared, (unsigned)drew, (unsigned)backres);
+                  return (*env)->NewIntArray(env, 0);
+              }
+              D3DLOCKED_RECT locked = {0};
+              HRESULT readres = back->lpVtbl->LockRect(back, &locked, NULL, D3DLOCK_READONLY);
+              if (readres != 0 || !locked.pBits || locked.Pitch < W*4) {
+                  snprintf(g_report, sizeof g_report, "V16: Clear=0x%08X; Triangulo=0x%08X; LockRect FALHOU 0x%08X",
+                           (unsigned)cleared, (unsigned)drew, (unsigned)readres);
+                  back->lpVtbl->Release(back);
+                  return (*env)->NewIntArray(env, 0);
+              }
+
+              jintArray image = (*env)->NewIntArray(env, W*H);
+              if (!image) {
+                  back->lpVtbl->UnlockRect(back);
+                  back->lpVtbl->Release(back);
+                  snprintf(g_report, sizeof g_report, "V16: Memoria Java insuficiente para imagem");
+                  return NULL;
+              }
+              jint pixels[W*H];
+              const uint8_t *rgba = (const uint8_t *)locked.pBits;
+              for (int y=0; y<H; ++y) {
+                  const uint8_t *row = rgba + (size_t)y*locked.Pitch;
+                  for (int x=0; x<W; ++x) {
+                      const uint8_t *px = row + (size_t)x*4;
+                      pixels[y*W+x] = (jint)(0xFF000000u | ((uint32_t)px[0]<<16) |
+                              ((uint32_t)px[1]<<8) | px[2]);
+                  }
+              }
+              const uint32_t edge = (uint32_t)pixels[5*W+5];
+              const uint32_t mid = (uint32_t)pixels[125*W+160];
+              const int er = (edge>>16)&255, eg = (edge>>8)&255, eb=edge&255;
+              const int mr = (mid>>16)&255, mg = (mid>>8)&255, mb=mid&255;
+              int clear_ok = cleared==0 && er>=18 && er<=30 && eg>=42 && eg<=58 && eb>=70 && eb<=90;
+              int tri_ok = drew==0 && mr>170 && mr>mg+50 && mr>mb+45;
+              (*env)->SetIntArrayRegion(env, image, 0, W*H, pixels);
+              back->lpVtbl->UnlockRect(back);
+              back->lpVtbl->Release(back);
+              snprintf(g_report, sizeof g_report,
+                       "DEF JAM - DESENHO XBOX V16\n\n"
+                       "Renderizador ORIGINAL D3D8 -> Vulkan\n"
+                       "CreateDevice: PASSOU\n"
+                       "Clear na GPU: %s\n"
+                       "DrawPrimitiveUP triangulo: %s\n"
+                       "GPU -> CPU LockRect: PASSOU\n"
+                       "Fundo RGB: %d, %d, %d\n"
+                       "Centro RGB: %d, %d, %d\n"
+                       "Imagem: 320 x 240 pixels\n\n"
+                       "PREVIA REAL LIDA DA GPU (NAO DO JOGO).\n"
+                       "Nao executa arquivos do Def Jam.",
+                       clear_ok ? "PASSOU" : "FALHOU", tri_ok ? "PASSOU" : "FALHOU",
+                       er,eg,eb,mr,mg,mb);
+              __android_log_print(ANDROID_LOG_INFO, "DefJamV16", "GPU pixels: clear=%d triangle=%d edge=%08x middle=%08x",
+                                  clear_ok, tri_ok, (unsigned)edge, (unsigned)mid);
+              return image;
+          }
+          EOFC
+          cat > defjam-v15/app/src/main/java/com/defjam/rendererprobe/MainActivity.java <<'EOFJAVA'
+          package com.defjam.rendererprobe;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              private static native int[] nativeRenderPixels();
+              private static native String nativeLastReport();
+
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(24,18,24,24);
+                  layout.setBackgroundColor(Color.rgb(12,19,33));
+                  TextView info = new TextView(this);
+                  info.setTextSize(17f);
+                  info.setTextColor(Color.WHITE);
+                  info.setGravity(Gravity.CENTER);
+                  info.setText("DEF JAM - DESENHO XBOX V16\n\nTeste do renderizador real D3D8 -> Vulkan.\n"
+                          + "Vamos desenhar um triangulo na GPU e copiar os pixels para a tela.\n"
+                          + "Ainda NAO e o jogo. Pode fechar se o driver falhar.");
+                  Button button = new Button(this);
+                  button.setText("DESENHAR COM GPU DO XBOX");
+                  ImageView preview = new ImageView(this);
+                  preview.setAdjustViewBounds(true);
+                  preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  preview.setBackgroundColor(Color.rgb(4,8,16));
+                  layout.addView(info);
+                  layout.addView(button);
+                  layout.addView(preview, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, 410));
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setFillViewport(true);
+                  scroll.addView(layout);
+                  setContentView(scroll);
+                  try { System.loadLibrary("v16probe"); }
+                  catch (Throwable err) {
+                      info.setText("ERRO AO CARREGAR V16:\n" + err);
+                      button.setEnabled(false);
+                      return;
+                  }
+                  button.setOnClickListener(v -> {
+                      button.setEnabled(false);
+                      info.setText("V16: Inicializando GPU, desenhando e lendo pixels...");
+                      new Thread(() -> {
+                          int[] pixels = null;
+                          String report;
+                          try {
+                              pixels = nativeRenderPixels();
+                              report = nativeLastReport();
+                          } catch (Throwable err) { report = "ERRO NATIVO V16:\n" + err; }
+                          final int[] output = pixels;
+                          final String message = report;
+                          runOnUiThread(() -> {
+                              info.setText(message);
+                              if (output != null && output.length == 320*240) {
+                                  Bitmap bmp = Bitmap.createBitmap(320,240,Bitmap.Config.ARGB_8888);
+                                  bmp.setPixels(output,0,320,0,0,320,240);
+                                  preview.setImageBitmap(bmp);
+                              }
+                              button.setText("TESTE FINALIZADO");
+                          });
+                      }, "RealXboxGPUReadbackV16").start();
+                  });
+              }
+          }
+          EOFJAVA
+          sed -i 's/v15probe/v16probe/g' defjam-v15/app/src/main/cpp/CMakeLists.txt
+          python3 - <<'PYPATCH'
+          from pathlib import Path
+          gradle=Path('defjam-v15/app/build.gradle')
+          g=gradle.read_text()
+          assert "applicationId 'com.defjam.rendererdevice'" in g
+          assert 'versionCode 15' in g
+          g=g.replace("applicationId 'com.defjam.rendererdevice'", "applicationId 'com.defjam.renderpixelsv16'")
+          g=g.replace('versionCode 15','versionCode 16').replace("versionName '0.15'","versionName '0.16'")
+          gradle.write_text(g)
+          manifest=Path('defjam-v15/app/src/main/AndroidManifest.xml')
+          m=manifest.read_text()
+          assert 'Def Jam - GPU Xbox V15' in m
+          m=m.replace('Def Jam - GPU Xbox V15','Def Jam - Desenho Xbox V16')
+          m=m.replace('android:name=".MainActivity"','android:name="com.defjam.rendererprobe.MainActivity"')
+          manifest.write_text(m)
+          print('V16 standalone app, real D3D8 drawing, LockRect GPU readback and bitmap preview ready')
+          PYPATCH
+
+      - name: Build and verify V16 Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v15 :app:assembleDebug --no-daemon --stacktrace \
+            > v15-logs/v16-build.log 2>&1 || { tail -n 120 v15-logs/v16-build.log; exit 1; }
+          apk=defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          unzip -l "$apk" > v15-logs/v16-apk-contents.txt
+          for name in libxbox_d3d8_vk_experimental.so libc++_shared.so libv16probe.so; do
+            grep -Fq "lib/arm64-v8a/$name" v15-logs/v16-apk-contents.txt || { echo "Missing library $name"; exit 1; }
+          done
+          sha256sum "$apk" > v15-logs/v16-sha256.txt
+          du -h "$apk"
+          echo 'PASS: V16 real Xbox Vulkan renderer, real D3D8 Clear/DrawPrimitiveUP/LockRect test, and Java bitmap preview.'
+
+      - name: Upload V16 graphics drawing test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v16-real-xbox-gpu-draw-readback-apk
+          path: defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload V16 build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v16-drawing-build-report
+          path: v15-logs/
+          if-no-files-found: warn
