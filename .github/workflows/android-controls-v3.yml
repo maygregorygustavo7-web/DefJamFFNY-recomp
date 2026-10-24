@@ -1,0 +1,451 @@
+name: Def Jam - Android controls V3 (custom layouts)
+
+on:
+  push:
+    branches: [android-prototype]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout experiment branch
+        uses: actions/checkout@v4
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Verify preinstalled Android SDK
+        shell: bash
+        run: |
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2"
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Prepare standalone controls V3 application
+        shell: bash
+        run: |
+          mkdir -p prototype-android/app/src/main/java/com/defjam/prototype
+          cat > prototype-android/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DefJamTouchPrototype'
+          include ':app'
+          EOF
+          cat > prototype-android/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > prototype-android/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.defjam.prototype'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.defjam.prototype'
+                  minSdk 26
+                  targetSdk 28
+                  versionCode 3
+                  versionName '0.3'
+              }
+          }
+          EOF
+          cat > prototype-android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          cat > prototype-android/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Def Jam - Controls V3" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > prototype-android/app/src/main/java/com/defjam/prototype/MainActivity.java <<'JAVA'
+          package com.defjam.prototype;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.os.Bundle;
+          import android.content.SharedPreferences;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.widget.LinearLayout;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+              private TouchPad pad;
+              private SharedPreferences preferences;
+
+              private static class Control {
+                  String name;
+                  float x, y, scale;
+                  int opacity;
+                  boolean stick;
+                  Control(String name, float x, float y, boolean stick) {
+                      this.name = name;
+                      this.x = x; this.y = y; this.stick = stick;
+                      this.scale = 1f; this.opacity = 65;
+                  }
+              }
+
+              private final Control[] controls = new Control[] {
+                  new Control("L2", .072f, .15f, false),
+                  new Control("L1", .175f, .15f, false),
+                  new Control("R1", .825f, .15f, false),
+                  new Control("R2", .928f, .15f, false),
+                  new Control("↑", .145f, .50f, false),
+                  new Control("←", .085f, .63f, false),
+                  new Control("→", .205f, .63f, false),
+                  new Control("↓", .145f, .76f, false),
+                  new Control("□", .795f, .63f, false),
+                  new Control("△", .855f, .50f, false),
+                  new Control("○", .915f, .63f, false),
+                  new Control("×", .855f, .76f, false),
+                  new Control("SELECT", .45f, .88f, false),
+                  new Control("START", .55f, .88f, false),
+                  new Control("L3", .33f, .93f, false),
+                  new Control("R3", .67f, .93f, false),
+                  new Control("ANALÓGICO E", .33f, .70f, true),
+                  new Control("ANALÓGICO D", .67f, .70f, true)
+              };
+              private int selected = -1;
+              private boolean editMode = false;
+              private final Set<Integer> pressed = new HashSet<>();
+              private final Map<Integer, Integer> editingPointers = new HashMap<>();
+              private final int[] stickPointer = {-1,-1};
+              private final float[] axisX = {0f,0f};
+              private final float[] axisY = {0f,0f};
+
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  preferences = getSharedPreferences("control_layout_v3", MODE_PRIVATE);
+                  load();
+                  getWindow().getDecorView().setSystemUiVisibility(
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                      View.SYSTEM_UI_FLAG_FULLSCREEN |
+                      View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                      View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+                      View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                      View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+                  pad = new TouchPad();
+                  setContentView(pad);
+              }
+
+              private void save() {
+                  StringBuilder b = new StringBuilder();
+                  for (Control c : controls) {
+                      b.append(c.x).append(',').append(c.y).append(',')
+                       .append(c.scale).append(',').append(c.opacity).append(';');
+                  }
+                  preferences.edit().putString("layout", b.toString()).apply();
+                  Toast.makeText(this, "Layout salvo no celular", Toast.LENGTH_SHORT).show();
+              }
+
+              private void load() {
+                  String stored = preferences.getString("layout", "");
+                  if (stored.isEmpty()) return;
+                  try {
+                      String[] items = stored.split(";");
+                      if (items.length != controls.length) return;
+                      for (int i = 0; i < items.length; i++) {
+                          String[] v = items[i].split(",");
+                          if (v.length != 4) return;
+                          float x = Float.parseFloat(v[0]);
+                          float y = Float.parseFloat(v[1]);
+                          float size = Float.parseFloat(v[2]);
+                          int alpha = Integer.parseInt(v[3]);
+                          if (x < 0f || x > 1f || y < 0f || y > 1f || size < .55f || size > 1.65f || alpha < 10 || alpha > 100) return;
+                          controls[i].x=x; controls[i].y=y; controls[i].scale=size; controls[i].opacity=alpha;
+                      }
+                  } catch (Exception ignored) { /* Invalid old settings: keep defaults. */ }
+              }
+
+              private void reset() {
+                  preferences.edit().remove("layout").apply();
+                  Control[] defaults = {
+                      new Control("L2",.072f,.15f,false), new Control("L1",.175f,.15f,false),
+                      new Control("R1",.825f,.15f,false), new Control("R2",.928f,.15f,false),
+                      new Control("↑",.145f,.50f,false), new Control("←",.085f,.63f,false),
+                      new Control("→",.205f,.63f,false), new Control("↓",.145f,.76f,false),
+                      new Control("□",.795f,.63f,false), new Control("△",.855f,.50f,false),
+                      new Control("○",.915f,.63f,false), new Control("×",.855f,.76f,false),
+                      new Control("SELECT",.45f,.88f,false), new Control("START",.55f,.88f,false),
+                      new Control("L3",.33f,.93f,false), new Control("R3",.67f,.93f,false),
+                      new Control("ANALÓGICO E",.33f,.70f,true), new Control("ANALÓGICO D",.67f,.70f,true)
+                  };
+                  for (int i=0;i<controls.length;i++) {
+                      controls[i].x=defaults[i].x; controls[i].y=defaults[i].y;
+                      controls[i].scale=1f; controls[i].opacity=65;
+                  }
+                  selected=-1;
+                  pad.invalidate();
+                  Toast.makeText(this,"Layout padrão restaurado",Toast.LENGTH_SHORT).show();
+              }
+
+              private void showMenu() {
+                  String[] options = {
+                      editMode ? "Concluir movimentação" : "Mover botões e analógicos",
+                      "Ajustar tamanho e opacidade do selecionado",
+                      "Ajustar tamanho e opacidade de todos",
+                      "Salvar layout",
+                      "Restaurar padrão"
+                  };
+                  new AlertDialog.Builder(this).setTitle("Def Jam | Configurar controles")
+                      .setItems(options, (dialog, which) -> {
+                          if (which == 0) {
+                              editMode = !editMode;
+                              editingPointers.clear();
+                              pressed.clear();
+                              stickPointer[0]=stickPointer[1]=-1;
+                              axisX[0]=axisX[1]=axisY[0]=axisY[1]=0f;
+                              pad.invalidate();
+                              Toast.makeText(this,editMode ? "Arraste os controles para reposicionar" : "Modo jogo",Toast.LENGTH_SHORT).show();
+                          } else if (which == 1) {
+                              if (selected < 0) {
+                                  Toast.makeText(this,"Primeiro escolha Mover botões e toque em um controle",Toast.LENGTH_LONG).show();
+                              } else {
+                                  showAdjustDialog(false);
+                              }
+                          } else if (which == 2) {
+                              showAdjustDialog(true);
+                          } else if (which == 3) {
+                              save();
+                          } else if (which == 4) {
+                              new AlertDialog.Builder(this).setTitle("Restaurar layout?")
+                                  .setMessage("Isso apaga as posições, tamanhos e transparências salvos.")
+                                  .setNegativeButton("Cancelar",null)
+                                  .setPositiveButton("Restaurar",(d,w)->reset()).show();
+                          }
+                      }).setNegativeButton("Fechar",null).show();
+              }
+
+              private void showAdjustDialog(boolean all) {
+                  final Control c = all ? controls[0] : controls[selected];
+                  LinearLayout panel = new LinearLayout(this);
+                  panel.setPadding(38,20,38,16);
+                  panel.setOrientation(LinearLayout.VERTICAL);
+                  TextView sizeLabel=new TextView(this);
+                  TextView alphaLabel=new TextView(this);
+                  SeekBar size=new SeekBar(this);
+                  SeekBar alpha=new SeekBar(this);
+                  size.setMax(110); size.setProgress((int)(c.scale*100)-55);
+                  alpha.setMax(90); alpha.setProgress(c.opacity-10);
+                  sizeLabel.setText("Tamanho: "+(int)(c.scale*100)+"%");
+                  alphaLabel.setText("Opacidade: "+c.opacity+"%");
+                  panel.addView(sizeLabel); panel.addView(size);
+                  panel.addView(alphaLabel); panel.addView(alpha);
+                  size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar s,int progress,boolean user) {
+                          float v=(55+progress)/100f;
+                          if (all) { for(Control ctrl:controls)ctrl.scale=v; }
+                          else c.scale=v;
+                          sizeLabel.setText("Tamanho: "+(55+progress)+"%");
+                          pad.invalidate();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s) {}
+                      @Override public void onStopTrackingTouch(SeekBar s) {}
+                  });
+                  alpha.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar s,int progress,boolean user) {
+                          int v=10+progress;
+                          if (all) { for(Control ctrl:controls)ctrl.opacity=v; }
+                          else c.opacity=v;
+                          alphaLabel.setText("Opacidade: "+v+"%");
+                          pad.invalidate();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s) {}
+                      @Override public void onStopTrackingTouch(SeekBar s) {}
+                  });
+                  new AlertDialog.Builder(this)
+                      .setTitle(all ? "Todos os controles" : "Controle: "+c.name)
+                      .setView(panel)
+                      .setPositiveButton("Salvar", (d,w)-> save())
+                      .setNegativeButton("Fechar",null).show();
+              }
+
+              private class TouchPad extends View {
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  TouchPad() { super(MainActivity.this); }
+
+                  @Override protected void onDraw(Canvas cv) {
+                      float w=getWidth(), h=getHeight();
+                      cv.drawColor(Color.rgb(15,23,35));
+                      p.setStyle(Paint.Style.FILL);
+                      p.setTextAlign(Paint.Align.CENTER);
+                      p.setColor(Color.WHITE);
+                      p.setAlpha(255);
+                      p.setTextSize(h*.044f);
+                      cv.drawText("DEF JAM - CONTROLES ANDROID V3",w*.5f,h*.29f,p);
+                      p.setTextSize(h*.025f);
+                      p.setColor(Color.LTGRAY);
+                      cv.drawText(editMode ? "EDIÇÃO: TOQUE E ARRASTE CADA CONTROLE" : "PROTÓTIPO - O JOGO AINDA NÃO ESTÁ INTEGRADO",w*.5f,h*.35f,p);
+                      p.setTextSize(h*.022f);
+                      cv.drawText(editMode ? "SELECIONADO: "+(selected>=0?controls[selected].name:"nenhum") :
+                          String.format(Locale.US,"ANALÓGICOS  E (%.2f, %.2f)   D (%.2f, %.2f)",axisX[0],axisY[0],axisX[1],axisY[1]),w*.5f,h*.48f,p);
+                      p.setTextSize(h*.021f);
+                      cv.drawText("TOQUE NA ENGRENAGEM PARA EDITAR OU SALVAR",w*.5f,h*.55f,p);
+
+                      for(int i=0;i<controls.length;i++) {
+                          Control c=controls[i];
+                          float x=c.x*w, y=c.y*h;
+                          int al=(int)(255f*c.opacity/100f);
+                          if(c.stick) {
+                              int axis=(i==16)?0:1;
+                              float r=h*.115f*c.scale;
+                              p.setStyle(Paint.Style.FILL);
+                              p.setColor(Color.rgb(60,82,116)); p.setAlpha(al);
+                              cv.drawCircle(x,y,r,p);
+                              p.setStyle(Paint.Style.STROKE);
+                              p.setStrokeWidth(h*.005f);
+                              p.setColor(Color.rgb(150,182,224)); p.setAlpha(al);
+                              cv.drawCircle(x,y,r,p);
+                              p.setStyle(Paint.Style.FILL);
+                              p.setColor(Color.rgb(150,178,218));p.setAlpha(al);
+                              cv.drawCircle(x+axisX[axis]*r,y+axisY[axis]*r,r*.38f,p);
+                              p.setColor(Color.WHITE);p.setAlpha(235);
+                              p.setTextSize(h*.021f);
+                              cv.drawText(c.name,x,y-r-h*.018f,p);
+                          } else {
+                              float r=h*.061f*c.scale;
+                              boolean down=pressed.contains(i);
+                              p.setStyle(Paint.Style.FILL);
+                              p.setColor(down?Color.rgb(22,196,167):Color.rgb(76,99,137));
+                              p.setAlpha(down?240:al);
+                              cv.drawCircle(x,y,r,p);
+                              p.setColor(Color.WHITE);p.setAlpha(Math.max(75,al));
+                              p.setTextSize(c.name.length()>2?h*.023f:c.name.length()>1?h*.037f:h*.044f);
+                              cv.drawText(c.name,x,y+h*.014f,p);
+                          }
+                          if (editMode && selected==i) {
+                              p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(h*.006f);
+                              p.setColor(Color.rgb(46,234,193));p.setAlpha(255);
+                              cv.drawCircle(x,y,(c.stick?h*.13f:h*.077f)*c.scale,p);
+                              p.setStyle(Paint.Style.FILL);
+                          }
+                      }
+                      float gx=w*.958f,gy=h*.087f;
+                      p.setStyle(Paint.Style.FILL);p.setColor(Color.rgb(44,103,144));p.setAlpha(235);
+                      cv.drawCircle(gx,gy,h*.062f,p);
+                      p.setColor(Color.WHITE);p.setTextSize(h*.048f);p.setAlpha(255);
+                      cv.drawText("⚙",gx,gy+h*.017f,p);
+                  }
+
+                  private int pick(float x,float y) {
+                      float w=getWidth(),h=getHeight();
+                      int best=-1;float bestDist=Float.MAX_VALUE;
+                      for(int i=0;i<controls.length;i++) {
+                          Control c=controls[i];
+                          float dx=x-c.x*w,dy=y-c.y*h;
+                          float r=h*(c.stick?.14f:.083f)*c.scale;
+                          float d=dx*dx+dy*dy;
+                          if(d<=r*r && d<bestDist){best=i;bestDist=d;}
+                      }
+                      return best;
+                  }
+
+                  @Override public boolean onTouchEvent(MotionEvent event) {
+                      int action=event.getActionMasked();
+                      if(action==MotionEvent.ACTION_CANCEL) {
+                          pressed.clear(); editingPointers.clear();
+                          stickPointer[0]=stickPointer[1]=-1;
+                          axisX[0]=axisX[1]=axisY[0]=axisY[1]=0f;
+                          invalidate();return true;
+                      }
+                      if(action==MotionEvent.ACTION_DOWN||action==MotionEvent.ACTION_POINTER_DOWN) {
+                          int index=event.getActionIndex();
+                          int id=event.getPointerId(index);
+                          float x=event.getX(index),y=event.getY(index),h=getHeight();
+                          float dx=x-getWidth()*.958f,dy=y-h*.087f;
+                          if(dx*dx+dy*dy<h*h*.005f) { showMenu();return true; }
+                          if(editMode) {
+                              int chosen=pick(x,y);
+                              if(chosen>=0){selected=chosen;editingPointers.put(id,chosen);invalidate();}
+                          } else {
+                              for(int a=0;a<2;a++) {
+                                  Control c=controls[16+a];
+                                  float sx=x-c.x*getWidth(),sy=y-c.y*h;
+                                  float r=h*.15f*c.scale;
+                                  if(stickPointer[a]==-1 && sx*sx+sy*sy<=r*r) {
+                                      stickPointer[a]=id;
+                                      break;
+                                  }
+                              }
+                          }
+                      }
+                      if(editMode) {
+                          int lifted=(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_POINTER_UP)
+                              ?event.getPointerId(event.getActionIndex()):-1;
+                          for(int i=0;i<event.getPointerCount();i++) {
+                              int id=event.getPointerId(i);
+                              if(id==lifted)continue;
+                              Integer controlIndex=editingPointers.get(id);
+                              if(controlIndex==null)continue;
+                              Control c=controls[controlIndex];
+                              float x=event.getX(i)/getWidth(),y=event.getY(i)/getHeight();
+                              c.x=Math.max(.045f,Math.min(.955f,x));
+                              c.y=Math.max(.09f,Math.min(.95f,y));
+                          }
+                          if(lifted!=-1)editingPointers.remove(lifted);
+                          invalidate();return true;
+                      }
+                      int lifted=(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_POINTER_UP)
+                          ?event.getPointerId(event.getActionIndex()):-1;
+                      if(lifted!=-1){for(int a=0;a<2;a++)if(stickPointer[a]==lifted)stickPointer[a]=-1;}
+                      pressed.clear();axisX[0]=axisX[1]=axisY[0]=axisY[1]=0f;
+                      float w=getWidth(),h=getHeight();
+                      for(int i=0;i<event.getPointerCount();i++) {
+                          int id=event.getPointerId(i);
+                          if(id==lifted)continue;
+                          float x=event.getX(i),y=event.getY(i);
+                          boolean analog=false;
+                          for(int a=0;a<2;a++)if(stickPointer[a]==id){
+                              Control c=controls[16+a];
+                              float r=h*.115f*c.scale;
+                              float vx=(x-c.x*w)/r,vy=(y-c.y*h)/r;
+                              float len=(float)Math.sqrt(vx*vx+vy*vy);
+                              if(len>1f){vx/=len;vy/=len;}
+                              axisX[a]=vx;axisY[a]=vy;analog=true;break;
+                          }
+                          if(analog)continue;
+                          int hit=pick(x,y);
+                          if(hit>=0 && hit<16)pressed.add(hit);
+                      }
+                      if(action==MotionEvent.ACTION_UP) {
+                          stickPointer[0]=stickPointer[1]=-1;
+                          pressed.clear();axisX[0]=axisX[1]=axisY[0]=axisY[1]=0f;
+                      }
+                      invalidate();return true;
+                  }
+              }
+          }
+          JAVA
+      - name: Compile Android APK
+        run: gradle -p prototype-android :app:assembleDebug --no-daemon --stacktrace
+      - name: Upload V3 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-controls-v3-apk
+          path: prototype-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
