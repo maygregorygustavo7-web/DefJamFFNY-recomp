@@ -1,0 +1,243 @@
+name: Def Jam - V7 native Xbox kernel device test
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-runtime-v7.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-xbox-runtime-on-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Get fork and pinned Xbox runtime
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Verify Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          test -f tools/xboxrecomp/src/kernel/kernel_crypto.c
+
+      - name: Apply temporary Android compatibility patches to checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('tools/xboxrecomp/src/platform/win32_compat.c')
+          s = source.read_text(encoding='utf-8')
+          def patch(a, b):
+              global s
+              assert s.count(a) == 1, f'Unexpected source for: {a[:80]!r}'
+              s = s.replace(a, b, 1)
+          patch('#include <sys/mman.h>\n',
+                '#include <sys/mman.h>\n#if defined(__ANDROID__)\n#include <sys/syscall.h>\n#endif\n')
+          patch('    pthread_cancel(o->thread);\n',
+                '''#if defined(__ANDROID__)
+          /* Build-only workaround: proper thread shutdown is NOT implemented. */
+          (void)exitCode;
+          errno = ENOSYS;
+          return FALSE;
+          #else
+          pthread_cancel(o->thread);
+          #endif
+          ''')
+          patch('''#if defined(__APPLE__)
+          memset_s(ptr, cnt, 0, cnt);
+          #else
+          explicit_bzero(ptr, cnt);
+          #endif
+          ''', '''#if defined(__APPLE__)
+          memset_s(ptr, cnt, 0, cnt);
+          #elif defined(__ANDROID__)
+          volatile unsigned char *p = (volatile unsigned char *)ptr;
+          while (cnt--) *p++ = 0;
+          #else
+          explicit_bzero(ptr, cnt);
+          #endif
+          ''')
+          patch('''#else
+          return memfd_create(name ? name : "xbox_map", 0);
+          #endif
+          ''','''#elif defined(__ANDROID__)
+          return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);
+          #else
+          return memfd_create(name ? name : "xbox_map", 0);
+          #endif
+          ''')
+          source.write_text(s, encoding='utf-8')
+          print('Three V6 compatibility patches applied in temporary runner only.')
+          PY
+
+      - name: Generate game-free Android app with actual Xbox kernel test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-v7/app/src/main/java/com/defjam/kerneltest
+          mkdir -p android-v7/app/src/main/cpp
+          cat > android-v7/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DefJamRealXboxKernelProbe'
+          include ':app'
+          EOF
+          cat > android-v7/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > android-v7/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          cat > android-v7/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.defjam.kerneltest'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.defjam.kerneltest'
+                  minSdk 28
+                  targetSdk 28
+                  versionCode 7
+                  versionName '0.7'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt' } }
+          }
+          EOF
+          cat > android-v7/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Def Jam - Xbox Kernel V7" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > android-v7/app/src/main/java/com/defjam/kerneltest/MainActivity.java <<'EOF'
+          package com.defjam.kerneltest;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              private static native String nativeXboxKernelTest();
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  getWindow().getDecorView().setSystemUiVisibility(
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                      View.SYSTEM_UI_FLAG_FULLSCREEN |
+                      View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+                  TextView output = new TextView(this);
+                  output.setGravity(Gravity.CENTER);
+                  output.setPadding(20, 20, 20, 20);
+                  output.setTextSize(22);
+                  output.setTextColor(Color.WHITE);
+                  output.setBackgroundColor(Color.rgb(15, 23, 35));
+                  try {
+                      System.loadLibrary("xboxkerneltest");
+                      output.setText(nativeXboxKernelTest());
+                  } catch (Throwable error) {
+                      output.setText("V7: FALHA AO INICIAR BIBLIOTECA XBOX\n" + error);
+                  }
+                  setContentView(output);
+              }
+          }
+          EOF
+          cat > android-v7/app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(defjam_real_xbox_kernel_test LANGUAGES C CXX)
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          get_filename_component(XBOXRECOMP_ROOT
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/xboxrecomp" ABSOLUTE)
+          add_subdirectory("${XBOXRECOMP_ROOT}/src/settings" "${CMAKE_BINARY_DIR}/xbox_settings")
+          add_subdirectory("${XBOXRECOMP_ROOT}/src/platform" "${CMAKE_BINARY_DIR}/xbox_platform")
+          add_subdirectory("${XBOXRECOMP_ROOT}/src/kernel" "${CMAKE_BINARY_DIR}/xbox_kernel")
+          add_library(xboxkerneltest SHARED xbox_kernel_test.cpp)
+          target_compile_features(xboxkerneltest PRIVATE cxx_std_17)
+          target_include_directories(xboxkerneltest PRIVATE
+              "${XBOXRECOMP_ROOT}/src"
+              "${XBOXRECOMP_ROOT}/src/platform"
+              "${XBOXRECOMP_ROOT}/src/kernel")
+          target_link_libraries(xboxkerneltest PRIVATE xbox_kernel platform recomp_settings)
+          target_link_options(xboxkerneltest PRIVATE -Wl,--no-undefined)
+          EOF
+          cat > android-v7/app/src/main/cpp/xbox_kernel_test.cpp <<'EOF'
+          #include <jni.h>
+          #include <cstdio>
+          #include <cstring>
+          #include "kernel.h"
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_defjam_kerneltest_MainActivity_nativeXboxKernelTest(JNIEnv *env, jclass) {
+              XBOX_SHA_CONTEXT ctx{};
+              const unsigned char sample[] = {'a', 'b', 'c'};
+              unsigned char digest[20]{};
+              const unsigned char expected[20] = {
+                0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
+                0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d
+              };
+              // Calls the actual Xbox HLE kernel_crypto.c, not a reimplementation in this test.
+              xbox_XcSHAInit(&ctx);
+              xbox_XcSHAUpdate(&ctx, sample, 3);
+              xbox_XcSHAFinal(&ctx, digest);
+              bool shaPass = std::memcmp(digest, expected, 20) == 0;
+              // Calls the actual Xbox runtime POSIX platform compatibility layer.
+              SetLastError(73);
+              bool platformPass = (GetLastError() == 73);
+              char out[500];
+              std::snprintf(out, sizeof(out),
+                "DEF JAM - XBOX KERNEL V7\n\n"
+                "Android ARM64 - CODIGO REAL DO XBOXRECOMP\n\n"
+                "Xbox SHA-1 (abc): %s\n"
+                "Plataforma GetLastError: %s\n\n"
+                "Teste de bibliotecas, NAO o jogo.\n"
+                "Thread shutdown e graficos ainda nao portados.",
+                shaPass ? "PASSOU" : "FALHOU",
+                platformPass ? "PASSOU" : "FALHOU");
+              return env->NewStringUTF(out);
+          }
+          EOF
+
+      - name: Build real kernel test APK
+        shell: bash
+        run: gradle -p android-v7 :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify actual ARM64 .so in APK
+        shell: bash
+        run: unzip -l android-v7/app/build/outputs/apk/debug/app-debug.apk | grep -F 'lib/arm64-v8a/libxboxkerneltest.so'
+
+      - name: Upload V7 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-real-xbox-kernel-v7-apk
+          path: android-v7/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
