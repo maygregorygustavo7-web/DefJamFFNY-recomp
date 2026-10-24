@@ -1,0 +1,117 @@
+name: Def Jam - V7D isolated Xbox kernel on Android
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-runtime-v7d.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-xbox-kernel-module:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout project and Xbox recompilation toolkit
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reuse V7C steps to prepare isolated native module
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          src = Path('.github/workflows/android-runtime-v7c.yml').read_text(encoding='utf-8')
+          headings = [
+            'Apply verified V6 compatibility workarounds to temporary checkout',
+            'Generate V7 native Android activity and JNI test source',
+            'Restrict native test to real crypto module and POSIX compatibility layer',
+          ]
+          for n, name in enumerate(headings, 1):
+              header = '      - name: ' + name + '\n'
+              if src.count(header) != 1:
+                  raise SystemExit('Missing or repeated V7C step: ' + name)
+              a = src.index('        run: |\n', src.index(header)) + len('        run: |\n')
+              b = src.find('      - name: ', a)
+              if b < 0:
+                  b = len(src)
+              block = src[a:b].splitlines(keepends=True)
+              lines = []
+              for line in block:
+                  if not line.strip():
+                      lines.append('\n')
+                  elif line.startswith('          '):
+                      lines.append(line[10:])
+                  else:
+                      raise SystemExit('Invalid indentation in V7C: ' + repr(line))
+              path = Path('/tmp/defjam-v7d-stage-%d.sh' % n)
+              path.write_text('set -euo pipefail\n' + ''.join(lines), encoding='utf-8')
+              print('Running stage:', name, flush=True)
+              subprocess.run(['bash', str(path)], check=True)
+          PY
+
+      - name: Supply genuine runtime logging dependency for isolated test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-v7/app/src/main/cpp
+          cat > android-v7/app/src/main/cpp/xbox_test_logger.cpp <<'EOF'
+          // Minimal logger for the isolated kernel-crypto test ONLY.
+          // This is not a replacement for the game's full logging/runtime system.
+          #include <cstdarg>
+          #include <cstdio>
+          extern "C" void xbox_log(int level, const char* subsystem, const char* fmt, ...) {
+              (void)level;
+              std::fprintf(stderr, "[Xbox test %s] ", subsystem ? subsystem : "runtime");
+              va_list args;
+              va_start(args, fmt);
+              std::vfprintf(stderr, fmt, args);
+              va_end(args);
+              std::fputc('\n', stderr);
+          }
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('android-v7/app/src/main/cpp/CMakeLists.txt')
+          s = path.read_text(encoding='utf-8')
+          old = 'add_library(xboxkerneltest SHARED xbox_kernel_test.cpp "${XBOXRECOMP_ROOT}/src/kernel/kernel_crypto.c")'
+          new = 'add_library(xboxkerneltest SHARED xbox_kernel_test.cpp xbox_test_logger.cpp "${XBOXRECOMP_ROOT}/src/kernel/kernel_crypto.c")'
+          if s.count(old) != 1:
+              raise SystemExit('Expected isolated crypto library declaration not found')
+          path.write_text(s.replace(old, new, 1), encoding='utf-8')
+          print('Added a test-only implementation of xbox_log for the isolated crypto module.')
+          PY
+
+      - name: Compile genuine Xbox crypto code into Android ARM64 APK
+        shell: bash
+        run: gradle -p android-v7 :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Confirm native ARM64 library inside APK
+        shell: bash
+        run: |
+          unzip -l android-v7/app/build/outputs/apk/debug/app-debug.apk | grep -F 'lib/arm64-v8a/libxboxkerneltest.so'
+
+      - name: Upload V7D test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-xbox-kernel-v7d-apk
+          path: android-v7/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
