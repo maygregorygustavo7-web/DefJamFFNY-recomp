@@ -1,0 +1,337 @@
+name: Def Jam - V15 initialize real Xbox D3D8 Vulkan GPU on Android
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-renderer-v15.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  xbox-gpu-headless:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout actual Xbox recompilation source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reuse V13 real ARM64 Xbox Vulkan renderer and NDK C++ library
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p v15-logs defjam-v15/app/src/main/jniLibs/arm64-v8a
+          gh run download 40050614511 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name defjam-xbox-vulkan-v13-experimental-arm64-so \
+            --dir v15-prebuilt > v15-logs/download.txt 2>&1 || {
+              cat v15-logs/download.txt
+              exit 1
+            }
+          so='v15-prebuilt/libxbox_d3d8_vk_experimental.so'
+          test -s "$so"
+          ndkbin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$ndkbin/llvm-readelf" -h "$so" > v15-logs/elf-header.txt
+          "$ndkbin/llvm-nm" -D --defined-only "$so" > v15-logs/exports.txt
+          grep -q AArch64 v15-logs/elf-header.txt
+          for symbol in xbox_Direct3DCreate8 xbox_GetD3DDevice \
+                        d3d8_GetBackbufferWidth d3d8_GetBackbufferHeight \
+                        d3d8_format_bpp d3d8_vk_set_host d3d8_vk_set_cache_dir; do
+            grep -Eq "[[:space:]]${symbol}$" v15-logs/exports.txt || {
+              echo "Missing V13 Xbox D3D8 export $symbol" >&2
+              exit 1
+            }
+          done
+          cp "$so" defjam-v15/app/src/main/jniLibs/arm64-v8a/libxbox_d3d8_vk_experimental.so
+          cpp="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          if [ ! -f "$cpp" ]; then
+            cpp="$ANDROID_NDK_HOME/sources/cxx-stl/llvm-libc++/libs/arm64-v8a/libc++_shared.so"
+          fi
+          test -f "$cpp"
+          cp "$cpp" defjam-v15/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+          test -f tools/xboxrecomp/src/d3d/d3d8_xbox.h
+          echo 'PASS: original V13 renderer and C++ runtime are available.'
+
+      - name: Generate V15 Gradle project and app metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p defjam-v15/app/src/main
+          cat > defjam-v15/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DefJamActualXboxGpuV15'
+          include ':app'
+          EOF
+          cat > defjam-v15/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > defjam-v15/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          cat > defjam-v15/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.defjam.rendererprobe'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.defjam.rendererdevice'
+                  minSdk 28
+                  targetSdk 28
+                  versionCode 15
+                  versionName '0.15'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt' } }
+          }
+          EOF
+          cat > defjam-v15/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Def Jam - GPU Xbox V15" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+      - name: Generate V15 interactive Android headless Xbox GPU initialization app
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f tools/xboxrecomp/src/d3d/d3d8_xbox.h
+          mkdir -p defjam-v15/app/src/main/java/com/defjam/rendererprobe defjam-v15/app/src/main/cpp
+          cat > defjam-v15/app/src/main/java/com/defjam/rendererprobe/MainActivity.java <<'EOF'
+          package com.defjam.rendererprobe;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Color;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              private static native String nativeTestRenderer();
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(25, 25, 25, 25);
+                  layout.setBackgroundColor(Color.rgb(12, 19, 33));
+                  TextView info = new TextView(this);
+                  info.setTextColor(Color.WHITE);
+                  info.setTextSize(19f);
+                  info.setGravity(Gravity.CENTER);
+                  info.setText("DEF JAM - GPU XBOX V15\n\nTeste REAL do dispositivo D3D8 Vulkan em modo sem janela.\n\n"
+                      + "O teste prepara a GPU e tenta compilar shaders do renderizador Xbox.\n"
+                      + "NAO e o jogo. Pode falhar ou fechar em drivers incompativeis.");
+                  Button start = new Button(this);
+                  start.setText("TESTAR RENDERIZADOR XBOX");
+                  layout.addView(info);
+                  layout.addView(start);
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setFillViewport(true);
+                  scroll.addView(layout);
+                  setContentView(scroll);
+                  try {
+                      System.loadLibrary("v15probe");
+                  } catch (Throwable t) {
+                      info.setText("ERRO AO CARREGAR TESTE V15:\n" + t.toString());
+                      start.setEnabled(false);
+                      return;
+                  }
+                  start.setOnClickListener(v -> {
+                      start.setEnabled(false);
+                      info.setText("DEF JAM - GPU XBOX V15\n\nInicializando Vulkan e shaders do Xbox...\n"
+                           + "(a primeira compilacao de shaders pode demorar)");
+                      new Thread(() -> {
+                          String output;
+                          try { output = nativeTestRenderer(); }
+                          catch (Throwable t) { output = "ERRO NATIVO V15:\n" + t.toString(); }
+                          final String msg = output;
+                          runOnUiThread(() -> {
+                              info.setText(msg);
+                              // Device initialization is a one-shot process-global test.
+                              start.setText("TESTE FINALIZADO");
+                          });
+                      }, "XboxRendererV15").start();
+                  });
+              }
+          }
+          EOF
+          cat > defjam-v15/app/src/main/cpp/renderer_probe.c <<'EOF'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <android/log.h>
+          #include "d3d8_xbox.h"
+
+          /* Experimental REAL renderer initialization without a window.
+             This uses xboxrecomp's D3D8 interface and GPU setup, not a demo
+             written separately with plain Vulkan. It does not load game data. */
+          JNIEXPORT jstring JNICALL
+          Java_com_defjam_rendererprobe_MainActivity_nativeTestRenderer(JNIEnv *env, jclass clazz) {
+              (void)clazz;
+              char output[1800] = {0};
+              void *handle = dlopen("libxbox_d3d8_vk_experimental.so", RTLD_NOW | RTLD_LOCAL);
+              if (!handle) {
+                  const char *why = dlerror();
+                  snprintf(output, sizeof output,
+                           "DEF JAM V15\n\nBiblioteca Xbox Vulkan: FALHOU\n%s",
+                           why ? why : "Erro desconhecido");
+                  return (*env)->NewStringUTF(env, output);
+              }
+
+              IDirect3D8 *(*make_d3d)(UINT) =
+                  (IDirect3D8 *(*)(UINT))dlsym(handle, "xbox_Direct3DCreate8");
+              void (*set_host)(const void *) =
+                  (void (*)(const void *))dlsym(handle, "d3d8_vk_set_host");
+              void (*set_cache_dir)(const char *) =
+                  (void (*)(const char *))dlsym(handle, "d3d8_vk_set_cache_dir");
+              IDirect3DDevice8 *(*get_device)(void) =
+                  (IDirect3DDevice8 *(*)(void))dlsym(handle, "xbox_GetD3DDevice");
+              UINT (*format_bpp)(D3DFORMAT) =
+                  (UINT (*)(D3DFORMAT))dlsym(handle, "d3d8_format_bpp");
+              UINT (*backbuffer_width)(void) =
+                  (UINT (*)(void))dlsym(handle, "d3d8_GetBackbufferWidth");
+              UINT (*backbuffer_height)(void) =
+                  (UINT (*)(void))dlsym(handle, "d3d8_GetBackbufferHeight");
+
+              if (!make_d3d || !set_host || !set_cache_dir || !get_device ||
+                  !format_bpp || !backbuffer_width || !backbuffer_height) {
+                  snprintf(output, sizeof output,
+                           "DEF JAM V15\n\nSimbolos D3D8 reais: FALHOU\n"
+                           "Verificar exports da V13.");
+                  return (*env)->NewStringUTF(env, output);
+              }
+
+              const int formats_ok = (format_bpp(D3DFMT_A8R8G8B8) == 32 &&
+                                      format_bpp(D3DFMT_R5G6B5) == 16 &&
+                                      format_bpp(D3DFMT_DXT1) == 4 &&
+                                      format_bpp(D3DFMT_A8) == 8);
+              set_host(NULL); // Explicit headless renderer: no Android surface.
+              set_cache_dir(NULL); // Disable disk caching for this one-shot test.
+              IDirect3D8 *d3d = make_d3d(0);
+              if (!d3d || !d3d->lpVtbl || !d3d->lpVtbl->CreateDevice) {
+                  snprintf(output, sizeof output,
+                           "DEF JAM V15\n\nInterface D3D8: FALHOU\n"
+                           "Texturas Xbox: %s", formats_ok ? "PASSOU" : "FALHOU");
+                  return (*env)->NewStringUTF(env, output);
+              }
+
+              D3DPRESENT_PARAMETERS pp;
+              memset(&pp, 0, sizeof pp);
+              pp.BackBufferWidth = 320;
+              pp.BackBufferHeight = 240;
+              pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+              pp.BackBufferCount = 1;
+              pp.Windowed = 1;
+              IDirect3DDevice8 *device = NULL;
+              __android_log_print(ANDROID_LOG_INFO, "DefJamV15", "Beginning real Xbox D3D8 renderer CreateDevice");
+              HRESULT hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &device);
+              const int ready = (hr == 0 && device != NULL && get_device() == device);
+              const UINT width = backbuffer_width();
+              const UINT height = backbuffer_height();
+              __android_log_print(ANDROID_LOG_INFO, "DefJamV15",
+                                  "Xbox D3D8 CreateDevice HRESULT=0x%x, ready=%d, %ux%u",
+                                  (unsigned)hr, ready, width, height);
+              snprintf(output, sizeof output,
+                       "DEF JAM - GPU XBOX V15\n\n"
+                       "Renderizador real do xboxrecomp\n\n"
+                       "Biblioteca ARM64: PASSOU\n"
+                       "Formatos de textura Xbox: %s\n"
+                       "Interface Xbox D3D8: PASSOU\n"
+                       "CreateDevice Vulkan REAL: %s\n"
+                       "Dispositivo Xbox: %s\n"
+                       "Target grafico: %u x %u\n"
+                       "HRESULT: 0x%08X\n\n"
+                       "Teste sem janela. Shaders internos so estao prontos\n"
+                       "se CreateDevice passou. NAO executa o jogo.",
+                       formats_ok ? "PASSOU" : "FALHOU",
+                       ready ? "PASSOU" : "FALHOU",
+                       ready ? "PASSOU" : "FALHOU",
+                       width, height, (unsigned)hr);
+              return (*env)->NewStringUTF(env, output);
+          }
+          EOF
+          cat > defjam-v15/app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(defjam_real_xbox_vulkan_device_probe LANGUAGES C)
+          get_filename_component(XBOXRECOMP_ROOT
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/xboxrecomp" ABSOLUTE)
+          add_library(v15probe SHARED renderer_probe.c)
+          target_include_directories(v15probe PRIVATE
+              "${XBOXRECOMP_ROOT}/src"
+              "${XBOXRECOMP_ROOT}/src/platform"
+              "${XBOXRECOMP_ROOT}/src/d3d")
+          target_link_libraries(v15probe PRIVATE dl log)
+          target_link_options(v15probe PRIVATE -Wl,--no-undefined)
+          EOF
+          printf '%s\n' \
+            'V15: real xboxrecomp D3D8 Vulkan CreateDevice headless, not a game.' \
+            'Device setup can fail on Android GPU/driver; failures are diagnostic.' \
+            'WARNING: a native crash may close this test application.' \
+            >> v15-logs/scope.txt
+
+      - name: Build and inspect V15 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p defjam-v15 :app:assembleDebug --no-daemon --stacktrace \
+            > v15-logs/build.log 2>&1 || {
+              tail -n 120 v15-logs/build.log
+              exit 1
+            }
+          apk=defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          unzip -l "$apk" > v15-logs/apk-contents.txt
+          for name in libxbox_d3d8_vk_experimental.so libc++_shared.so libv15probe.so; do
+            grep -Fq "lib/arm64-v8a/$name" v15-logs/apk-contents.txt || {
+              echo "APK missing: $name" >&2
+              exit 1
+            }
+          done
+          sha256sum "$apk" > v15-logs/apk-sha256.txt
+          du -h "$apk"
+          echo 'PASS: V15 APK packages genuine Xbox D3D8 Vulkan backend and JNI device test.'
+
+      - name: Upload V15 headless Xbox Vulkan GPU APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v15-real-xbox-gpu-headless-apk
+          path: defjam-v15/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload V15 diagnostics even if APK fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-v15-xbox-gpu-build-report
+          path: v15-logs/
+          if-no-files-found: warn
