@@ -1,0 +1,272 @@
+name: Def Jam - Android controls V2 (dual analog sticks)
+
+on:
+  push:
+    branches: [android-prototype]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout experimental branch
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check Android SDK installed on runner
+        shell: bash
+        run: |
+          echo "Android SDK: $ANDROID_HOME"
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2"
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Generate standalone touch-controls Android prototype
+        shell: bash
+        run: |
+          mkdir -p prototype-android/app/src/main/java/com/defjam/prototype
+          cat > prototype-android/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DefJamTouchPrototype'
+          include ':app'
+          EOF
+          cat > prototype-android/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > prototype-android/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.defjam.prototype'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.defjam.prototype'
+                  minSdk 26
+                  targetSdk 28
+                  versionCode 2
+                  versionName '0.2'
+              }
+          }
+          EOF
+          cat > prototype-android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+          cat > prototype-android/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Def Jam - Controls V2" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:screenOrientation="landscape" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > prototype-android/app/src/main/java/com/defjam/prototype/MainActivity.java <<'JAVA'
+          package com.defjam.prototype;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import java.util.HashSet;
+          import java.util.Locale;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+              @Override public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().getDecorView().setSystemUiVisibility(
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                      View.SYSTEM_UI_FLAG_FULLSCREEN |
+                      View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                      View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
+                      View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                      View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+                  setContentView(new TouchPad());
+              }
+
+              private class TouchPad extends View {
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final String[] names = {
+                      "L2", "L1", "R1", "R2",
+                      "↑", "←", "→", "↓",
+                      "□", "△", "○", "×",
+                      "SELECT", "START", "L3", "R3"
+                  };
+                  private final float[][] positions = {
+                      {.075f, .15f}, {.18f, .15f}, {.82f, .15f}, {.925f, .15f},
+                      {.145f, .50f}, {.085f, .63f}, {.205f, .63f}, {.145f, .76f},
+                      {.795f, .63f}, {.855f, .50f}, {.915f, .63f}, {.855f, .76f},
+                      {.45f, .88f}, {.55f, .88f}, {.33f, .93f}, {.67f, .93f}
+                  };
+                  private final float[] stickCenterX = {.33f, .67f};
+                  private final float[] stickCenterY = {.70f, .70f};
+                  private final int[] stickPointerId = {-1, -1};
+                  private final float[] axisX = {0f, 0f};
+                  private final float[] axisY = {0f, 0f};
+                  private final Set<Integer> pressed = new HashSet<>();
+
+                  TouchPad() {
+                      super(MainActivity.this);
+                      setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+                  }
+
+                  @Override protected void onDraw(Canvas canvas) {
+                      super.onDraw(canvas);
+                      float w = getWidth(), h = getHeight();
+                      canvas.drawColor(Color.rgb(15, 23, 35));
+                      p.setTextAlign(Paint.Align.CENTER);
+                      p.setStyle(Paint.Style.FILL);
+                      p.setColor(Color.WHITE);
+                      p.setTextSize(h * .046f);
+                      canvas.drawText("DEF JAM - CONTROLES ANDROID V2", w*.5f, h*.29f, p);
+                      p.setColor(Color.LTGRAY);
+                      p.setTextSize(h * .027f);
+                      canvas.drawText("DEMONSTRACAO - O JOGO AINDA NAO FOI INTEGRADO", w*.5f, h*.35f, p);
+
+                      float buttonRadius = h * .060f;
+                      for (int i = 0; i < names.length; ++i) {
+                          float bx = positions[i][0] * w, by = positions[i][1] * h;
+                          boolean down = pressed.contains(i);
+                          p.setColor(down ? Color.rgb(24, 185, 165) : Color.rgb(59, 75, 103));
+                          p.setAlpha(down ? 245 : 195);
+                          canvas.drawCircle(bx, by, buttonRadius, p);
+                          p.setColor(Color.WHITE);
+                          p.setAlpha(255);
+                          p.setTextSize(names[i].length() > 2 ? h * .022f : h * .040f);
+                          canvas.drawText(names[i], bx, by + h*.013f, p);
+                      }
+
+                      float ring = h * .115f;
+                      for (int i = 0; i < 2; ++i) {
+                          float x = w * stickCenterX[i], y = h * stickCenterY[i];
+                          p.setColor(Color.rgb(53, 72, 100));
+                          p.setAlpha(180);
+                          canvas.drawCircle(x, y, ring, p);
+                          p.setStyle(Paint.Style.STROKE);
+                          p.setStrokeWidth(h*.006f);
+                          p.setColor(Color.rgb(124, 153, 185));
+                          p.setAlpha(220);
+                          canvas.drawCircle(x, y, ring, p);
+                          p.setStyle(Paint.Style.FILL);
+                          p.setColor(stickPointerId[i] >= 0 ? Color.rgb(26, 196, 172) : Color.rgb(138, 159, 190));
+                          p.setAlpha(250);
+                          canvas.drawCircle(x + axisX[i]*ring, y + axisY[i]*ring, h*.045f, p);
+                          p.setAlpha(255);
+                          p.setColor(Color.WHITE);
+                          p.setTextSize(h*.024f);
+                          canvas.drawText(i == 0 ? "ANALOGICO E" : "ANALOGICO D", x, y - ring - h*.025f, p);
+                      }
+                      p.setColor(Color.rgb(195, 215, 233));
+                      p.setTextSize(h*.023f);
+                      canvas.drawText(String.format(Locale.US,
+                          "ESQ (%.2f, %.2f)    DIR (%.2f, %.2f)",
+                          axisX[0], axisY[0], axisX[1], axisY[1]), w*.5f, h*.49f, p);
+                      canvas.drawText("BOTOES: " + pressed.size() + "   |   MULTITOQUE ATIVO", w*.5f, h*.56f, p);
+                  }
+
+                  private void resetInput() {
+                      pressed.clear();
+                      for (int i = 0; i < 2; i++) {
+                          stickPointerId[i] = -1;
+                          axisX[i] = 0f;
+                          axisY[i] = 0f;
+                      }
+                  }
+
+                  @Override public boolean onTouchEvent(MotionEvent event) {
+                      int action = event.getActionMasked();
+                      if (action == MotionEvent.ACTION_CANCEL) {
+                          resetInput();
+                          invalidate();
+                          return true;
+                      }
+                      if (action == MotionEvent.ACTION_DOWN) resetInput();
+
+                      if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+                          int index = event.getActionIndex();
+                          float x = event.getX(index), y = event.getY(index);
+                          float radius = getHeight() * .155f;
+                          int chosen = -1;
+                          float best = radius * radius;
+                          for (int i = 0; i < 2; i++) {
+                              if (stickPointerId[i] != -1) continue;
+                              float dx = x - getWidth()*stickCenterX[i];
+                              float dy = y - getHeight()*stickCenterY[i];
+                              float dist2 = dx*dx + dy*dy;
+                              if (dist2 <= best) { best = dist2; chosen = i; }
+                          }
+                          if (chosen >= 0) stickPointerId[chosen] = event.getPointerId(index);
+                      }
+
+                      int lifted = -1;
+                      if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
+                          lifted = event.getPointerId(event.getActionIndex());
+                          for (int i = 0; i < 2; i++) {
+                              if (stickPointerId[i] == lifted) stickPointerId[i] = -1;
+                          }
+                      }
+
+                      pressed.clear();
+                      axisX[0] = axisY[0] = axisX[1] = axisY[1] = 0f;
+                      float w = getWidth(), h = getHeight();
+                      float ring = h * .115f, hit = h * .079f;
+                      for (int j = 0; j < event.getPointerCount(); ++j) {
+                          int id = event.getPointerId(j);
+                          if (id == lifted) continue;
+                          float x = event.getX(j), y = event.getY(j);
+                          boolean analogFinger = false;
+                          for (int i = 0; i < 2; i++) {
+                              if (stickPointerId[i] == id) {
+                                  float dx = (x - w*stickCenterX[i])/ring;
+                                  float dy = (y - h*stickCenterY[i])/ring;
+                                  float length = (float)Math.sqrt(dx*dx + dy*dy);
+                                  if (length > 1f) { dx /= length; dy /= length; }
+                                  axisX[i] = dx;
+                                  axisY[i] = dy;
+                                  analogFinger = true;
+                                  break;
+                              }
+                          }
+                          if (analogFinger) continue;
+                          for (int i = 0; i < names.length; ++i) {
+                              float dx = x - positions[i][0]*w;
+                              float dy = y - positions[i][1]*h;
+                              if (dx*dx + dy*dy <= hit*hit) pressed.add(i);
+                          }
+                      }
+                      if (action == MotionEvent.ACTION_UP) resetInput();
+                      invalidate();
+                      return true;
+                  }
+              }
+          }
+          JAVA
+
+      - name: Build Android debug APK
+        run: gradle -p prototype-android :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload Android V2 test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-controls-v2-apk
+          path: prototype-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
