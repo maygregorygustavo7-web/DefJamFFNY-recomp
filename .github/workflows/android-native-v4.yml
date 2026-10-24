@@ -1,0 +1,148 @@
+name: Def Jam - Android Native Bridge V4
+
+on:
+  push:
+    branches: [android-prototype]
+    paths:
+      - '.github/workflows/android-native-v4.yml'
+      - '.github/workflows/android-controls-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-bridge:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check preinstalled Android SDK and NDK
+        shell: bash
+        run: |
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2"
+          test -d "$ANDROID_NDK_HOME/toolchains/llvm"
+          echo "NDK: $ANDROID_NDK_HOME"
+          echo "CMake: $(command -v cmake)"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Reuse tested V3 controls and layout editor
+        shell: bash
+        run: |
+          python3 - <<'PYEXTRACT'
+          from pathlib import Path
+          src = Path('.github/workflows/android-controls-v3.yml').read_text(encoding='utf-8')
+          heading = '      - name: Prepare standalone controls V3 application\n'
+          next_heading = '      - name: Compile Android APK\n'
+          a = src.find(heading)
+          if a < 0:
+              raise SystemExit('Could not find V3 project generator in repository')
+          a = src.index('        run: |\n', a) + len('        run: |\n')
+          b = src.index(next_heading, a)
+          lines = src[a:b].splitlines(keepends=True)
+          commands = []
+          for line in lines:
+              if not line.strip():
+                  commands.append('\n')
+              elif line.startswith('          '):
+                  commands.append(line[10:])
+              else:
+                  raise SystemExit('Unexpected indentation in V3 workflow: '+repr(line))
+          Path('/tmp/prepare-v3.sh').write_text('set -euo pipefail\n'+''.join(commands), encoding='utf-8')
+          PYEXTRACT
+          bash /tmp/prepare-v3.sh
+
+      - name: Integrate JNI bridge with Android controls
+        shell: bash
+        run: |
+          python3 - <<'PYPATCH'
+          from pathlib import Path
+          build = Path('prototype-android/app/build.gradle')
+          s = build.read_text(encoding='utf-8')
+          assert 'versionCode 3' in s, 'V3 Gradle version missing'
+          assert "  defaultConfig {" in s, 'defaultConfig not found'
+          s = s.replace('versionCode 3', 'versionCode 4').replace("versionName '0.3'", "versionName '0.4'")
+          s = s.replace("applicationId 'com.defjam.prototype'", "applicationId 'com.defjam.nativebridge'")
+          s = s.replace('  defaultConfig {', "  defaultConfig {\n    ndk { abiFilters 'arm64-v8a' }", 1)
+          assert s.endswith('}\n'), 'Unexpected Gradle build file ending'
+          s = s[:-2] + "  externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt' } }\n}\n"
+          build.write_text(s, encoding='utf-8')
+
+          manifest = Path('prototype-android/app/src/main/AndroidManifest.xml')
+          m = manifest.read_text(encoding='utf-8')
+          manifest.write_text(m.replace('Def Jam - Controls V3', 'Def Jam - Native Bridge V4'), encoding='utf-8')
+
+          main = Path('prototype-android/app/src/main/java/com/defjam/prototype/MainActivity.java')
+          s = main.read_text(encoding='utf-8')
+          anchor = 'public class MainActivity extends Activity {'
+          assert s.count(anchor)==1
+          s = s.replace(anchor, anchor+'''
+                        // Experimental ARM64 native input bridge. This does not run the Xbox game.
+                        static { System.loadLibrary("defjambridge"); }
+                        private static native String nativeInputSummary(float lx, float ly, float rx, float ry, int buttonCount);
+          ''', 1)
+          old = 'cv.drawText("TOQUE NA ENGRENAGEM PARA EDITAR OU SALVAR",w*.5f,h*.55f,p);'
+          assert s.count(old)==1, 'V3 onDraw hook has changed'
+          s = s.replace(old, old+'''
+                                 p.setColor(Color.rgb(81,218,175));
+                                 p.setTextSize(h*.019f);
+                                 cv.drawText(nativeInputSummary(axisX[0],axisY[0],axisX[1],axisY[1],pressed.size()),w*.5f,h*.62f,p);
+          ''', 1)
+          s = s.replace('DEF JAM - CONTROLES ANDROID V3', 'DEF JAM - NATIVE BRIDGE V4')
+          main.write_text(s,encoding='utf-8')
+
+          native = Path('prototype-android/app/src/main/cpp')
+          native.mkdir(parents=True, exist_ok=True)
+          (native/'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.22.1)
+          project(defjambridge LANGUAGES CXX)
+          add_library(defjambridge SHARED bridge.cpp)
+          target_compile_features(defjambridge PRIVATE cxx_std_17)
+          ''', encoding='utf-8')
+          (native/'bridge.cpp').write_text(r'''#include <jni.h>
+          #include <cstdio>
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_defjam_prototype_MainActivity_nativeInputSummary(
+              JNIEnv* env, jclass, jfloat lx, jfloat ly, jfloat rx, jfloat ry, jint buttons) {
+              char summary[200];
+          #if defined(__aarch64__)
+              const char* architecture = "ARM64";
+          #else
+              const char* architecture = "UNKNOWN";
+          #endif
+              std::snprintf(summary, sizeof(summary),
+                            "C++ NATIVO %s ATIVO  |  E(%.2f, %.2f) D(%.2f, %.2f) BOTOES:%d",
+                            architecture, (double)lx, (double)ly, (double)rx, (double)ry,
+                            (int)buttons);
+              return env->NewStringUTF(summary);
+          }
+          ''',encoding='utf-8')
+          print('Patched V3 controls, input JNI method, ARM64 C++ native bridge, and CMake setup.')
+          PYPATCH
+
+      - name: Build Android ARM64 native APK
+        shell: bash
+        run: gradle -p prototype-android :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify ARM64 native library is included in APK
+        run: |
+          unzip -l prototype-android/app/build/outputs/apk/debug/app-debug.apk | grep -F 'lib/arm64-v8a/libdefjambridge.so'
+
+      - name: Upload test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: defjam-native-bridge-v4-apk
+          path: prototype-android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
